@@ -1,0 +1,65 @@
+# secrets / env
+.env
+.env.*
+!.env.example
+
+# virtual environments
+.venv/
+venv/
+env/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# git
+.git/
+.gitignore
+
+# logs / runtime files
+logs/
+*.log
+
+# local storage / downloads / temp media
+storage/
+downloads/
+tmp/
+temp/
+
+# model/cache folders
+.cache/
+models/
+
+# archives
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# data exports
+*.csv
+*.xlsx
+*.xls
+
+# media files
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,18 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.7.0+cpu
+sentence-transformers
+
+google-ads
+python-dotenv
+requests
+clickhouse-connect
+
+psycopg[binary]
+psycopg2-binary
+pgvector
+
+pillow
+opencv-python-headless
+numpy
+yt-dlp

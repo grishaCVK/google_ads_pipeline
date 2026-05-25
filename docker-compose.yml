@@ -1,0 +1,15 @@
+services:
+  app:
+    build: .
+    container_name: google_ads_pipeline_app
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      HF_HOME: /app/models/huggingface
+      TRANSFORMERS_CACHE: /app/models/huggingface
+      SENTENCE_TRANSFORMERS_HOME: /app/models/sentence_transformers
+    volumes:
+      - .:/app
+    command: python main.py

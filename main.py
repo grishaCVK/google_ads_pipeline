@@ -84,6 +84,15 @@ def get_optional_int_env(name: str) -> int | None:
     return int(value)
 
 
+def get_bool_env(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+
+    if value is None or not value.strip():
+        return default
+
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
 def run_embeddings_after_pipeline(
     *,
     customer_id: str,
@@ -130,6 +139,76 @@ def run_embeddings_after_pipeline(
     )
 
 
+def run_creative_assets_only(
+    *,
+    customer_id: str,
+) -> None:
+    print(
+        f"Google Ads creative assets only started: "
+        f"customer_id={customer_id}"
+    )
+
+    creative_assets_response_data, creative_asset_rows = (
+        google_ads_api.fetch_creative_assets_data(
+            customer_id=customer_id,
+        )
+    )
+
+    print(
+        f"Fetched Google Ads creative assets data: "
+        f"customer_id={customer_id}, "
+        f"rows={creative_assets_response_data['rows_count']}"
+    )
+
+    insert_raw_response(
+        customer_id=customer_id,
+        query_name="creative_assets",
+        query_text=(
+            google_ads_api.queries.AD_GROUP_AD_ASSET_QUERY
+            + "\n\n-- asset_group_asset\n\n"
+            + google_ads_api.queries.ASSET_GROUP_ASSET_QUERY
+        ),
+        response_data=creative_assets_response_data,
+        request_params={
+            "customer_id": customer_id,
+            "source": [
+                "ad_group_ad_asset_view",
+                "asset_group_asset",
+            ],
+            "granularity": "creative_asset_level",
+            "mode": "creative_assets_only",
+        },
+    )
+
+    print(
+        f"Raw Google Ads creative assets data saved: "
+        f"customer_id={customer_id}, "
+        f"rows={creative_assets_response_data['rows_count']}"
+    )
+
+    clickhouse_db.delete_creative_assets_for_customer(
+        customer_id=customer_id,
+    )
+
+    clickhouse_db.insert_creative_asset_rows(
+        rows=creative_asset_rows,
+    )
+
+    print(
+        f"{clickhouse_db.CREATIVE_ASSET_TABLE}: "
+        f"inserted {len(creative_asset_rows)} creative_asset rows"
+    )
+
+    run_embeddings_after_pipeline(
+        customer_id=customer_id,
+    )
+
+    print(
+        f"Google Ads creative assets only finished: "
+        f"customer_id={customer_id}"
+    )
+
+
 def run_pipeline_for_period(
     *,
     customer_id: str,
@@ -172,7 +251,7 @@ def run_pipeline_for_period(
     )
 
     # 3. Daily geo: campaign + device + network + country + region + city.
-    daily_geo_response_data, daily_geo_grouped_rows = (
+    daily_geo_response_data, daily_geo_rows = (
         google_ads_api.fetch_geo_daily_data(
             customer_id=customer_id,
             date_since=date_since,
@@ -216,18 +295,55 @@ def run_pipeline_for_period(
         f"rows={daily_search_term_response_data['rows_count']}"
     )
 
-    # 6. Creative assets: campaign/ad/ad_group/asset_group -> asset.
-    creative_assets_response_data, creative_asset_rows = (
-        google_ads_api.fetch_creative_assets_data(
+    # 6. Daily gender: campaign + ad_group + gender + device + network.
+    gender_daily_response_data, gender_daily_rows = (
+        google_ads_api.fetch_gender_daily_data(
             customer_id=customer_id,
+            date_since=date_since,
+            date_until=date_until,
         )
     )
 
     print(
-        f"Fetched Google Ads creative assets data: "
+        f"Fetched Google Ads gender daily data: "
         f"customer_id={customer_id}, "
-        f"rows={creative_assets_response_data['rows_count']}"
+        f"rows={gender_daily_response_data['rows_count']}"
     )
+
+    # 6. Creative assets: campaign/ad/ad_group/asset_group -> asset.
+    # Creative assets не являются дневной таблицей, поэтому на большом
+    # backfill их не дергаем каждый день.
+    fetch_creative_assets = get_bool_env(
+        "GOOGLE_FETCH_CREATIVE_ASSETS",
+        default=True,
+    )
+
+    creative_assets_response_data = {
+        "rows_count": 0,
+        "data": [],
+        "skipped": True,
+        "reason": "GOOGLE_FETCH_CREATIVE_ASSETS=0",
+    }
+    creative_asset_rows: list[list] = []
+
+    if fetch_creative_assets:
+        creative_assets_response_data, creative_asset_rows = (
+            google_ads_api.fetch_creative_assets_data(
+                customer_id=customer_id,
+            )
+        )
+
+        print(
+            f"Fetched Google Ads creative assets data: "
+            f"customer_id={customer_id}, "
+            f"rows={creative_assets_response_data['rows_count']}"
+        )
+    else:
+        print(
+            f"Google Ads creative assets skipped: "
+            f"customer_id={customer_id}, "
+            f"GOOGLE_FETCH_CREATIVE_ASSETS=0"
+        )
 
     # 7. raw_data append-only. Старые raw responses не удаляем.
     insert_raw_response(
@@ -359,28 +475,49 @@ def run_pipeline_for_period(
 
     insert_raw_response(
         customer_id=customer_id,
-        query_name="creative_assets",
-        query_text=(
-            google_ads_api.queries.AD_GROUP_AD_ASSET_QUERY
-            + "\n\n-- asset_group_asset\n\n"
-            + google_ads_api.queries.ASSET_GROUP_ASSET_QUERY
-        ),
-        response_data=creative_assets_response_data,
+        query_name="gender_daily",
+        query_text=google_ads_api.queries.GENDER_DAILY_QUERY,
+        response_data=gender_daily_response_data,
         request_params={
             "customer_id": customer_id,
-            "source": [
-                "ad_group_ad_asset_view",
-                "asset_group_asset",
+            "date_since": date_since,
+            "date_until": date_until,
+            "source": "gender_view",
+            "granularity": "gender_daily_level",
+            "segments": [
+                "date",
+                "device",
+                "ad_network_type",
+                "gender",
             ],
-            "granularity": "creative_asset_level",
         },
     )
 
     print(
-        f"Raw Google Ads creative assets data saved: "
+        f"Raw Google Ads gender daily data saved: "
         f"customer_id={customer_id}, "
-        f"rows={creative_assets_response_data['rows_count']}"
+        f"rows={gender_daily_response_data['rows_count']}"
     )
+
+    if fetch_creative_assets:
+        insert_raw_response(
+            customer_id=customer_id,
+            query_name="creative_assets",
+            query_text=(
+                google_ads_api.queries.AD_GROUP_AD_ASSET_QUERY
+                + "\n\n-- asset_group_asset\n\n"
+                + google_ads_api.queries.ASSET_GROUP_ASSET_QUERY
+            ),
+            response_data=creative_assets_response_data,
+            request_params={
+                "customer_id": customer_id,
+                "source": [
+                    "ad_group_ad_asset_view",
+                    "asset_group_asset",
+                ],
+                "granularity": "creative_asset_level",
+            },
+        )
 
     # 8. Перезаписываем formatted hourly_campaign_level.
     clickhouse_db.delete_goal_tables_for_period(
@@ -409,16 +546,19 @@ def run_pipeline_for_period(
     )
 
     # 10. Перезаписываем formatted geo_daily_region_level.
-    clickhouse_db.delete_daily_geo_tables_for_period(
+    clickhouse_db.delete_daily_geo_table_for_period(
         customer_id=customer_id,
         date_since=date_since,
         date_until=date_until,
     )
 
-    insert_grouped_rows(
-        grouped_rows=daily_geo_grouped_rows,
-        row_type="daily_geo",
-        insert_func=clickhouse_db.insert_daily_geo_rows,
+    clickhouse_db.insert_daily_geo_rows(
+        rows=daily_geo_rows,
+    )
+
+    print(
+        f"{clickhouse_db.DAILY_GEO_TABLE}: "
+        f"inserted {len(daily_geo_rows)} daily_geo rows"
     )
 
     # 11. Перезаписываем formatted daily_campaign_level.
@@ -450,19 +590,42 @@ def run_pipeline_for_period(
         f"inserted {len(daily_search_term_rows)} daily_search_term rows"
     )
 
-    # 13. Перезаписываем creative assets по customer_id.
-    clickhouse_db.delete_creative_assets_for_customer(
+    # 13. Перезаписываем formatted gender_daily_level.
+    clickhouse_db.delete_gender_daily_table_for_period(
         customer_id=customer_id,
+        date_since=date_since,
+        date_until=date_until,
     )
 
-    clickhouse_db.insert_creative_asset_rows(
-        rows=creative_asset_rows,
+    clickhouse_db.insert_gender_daily_rows(
+        rows=gender_daily_rows,
     )
 
     print(
-        f"{clickhouse_db.CREATIVE_ASSET_TABLE}: "
-        f"inserted {len(creative_asset_rows)} creative_asset rows"
+        f"{clickhouse_db.GENDER_DAILY_TABLE}: "
+        f"inserted {len(gender_daily_rows)} gender_daily rows"
     )
+
+    # 13. Перезаписываем creative assets по customer_id.
+    # Если GOOGLE_FETCH_CREATIVE_ASSETS=0, таблицу creative assets НЕ трогаем.
+    if fetch_creative_assets:
+        clickhouse_db.delete_creative_assets_for_customer(
+            customer_id=customer_id,
+        )
+
+        clickhouse_db.insert_creative_asset_rows(
+            rows=creative_asset_rows,
+        )
+
+        print(
+            f"{clickhouse_db.CREATIVE_ASSET_TABLE}: "
+            f"inserted {len(creative_asset_rows)} creative_asset rows"
+        )
+    else:
+        print(
+            f"{clickhouse_db.CREATIVE_ASSET_TABLE}: "
+            f"skipped, existing creative assets were not changed"
+        )
 
     print(
         f"Finished Google Ads period: "
@@ -474,6 +637,22 @@ def main() -> None:
     config.validate_config()
 
     customer_ids = config.GOOGLE_ADS_CUSTOMER_IDS
+
+    only_creative_assets = get_bool_env(
+        "GOOGLE_ONLY_CREATIVE_ASSETS",
+        default=False,
+    )
+
+    if only_creative_assets:
+        print("Google Ads creative assets only mode started")
+
+        for customer_id in customer_ids:
+            run_creative_assets_only(
+                customer_id=customer_id,
+            )
+
+        print("Google Ads creative assets only mode finished")
+        return
 
     if config.BACKFILL_MODE:
         date_since = config.BACKFILL_START_DATE

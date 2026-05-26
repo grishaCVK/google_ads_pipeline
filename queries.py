@@ -803,3 +803,136 @@ SELECT
 FROM asset_group_asset
 WHERE campaign.status != 'REMOVED'
 """
+
+GENDER_DAILY_QUERY = """
+SELECT
+  segments.date,
+  segments.device,
+  segments.ad_network_type,
+
+  customer.id,
+  customer.descriptive_name,
+
+  campaign.id,
+  campaign.name,
+  campaign.status,
+  campaign.primary_status,
+  campaign.advertising_channel_type,
+  campaign.advertising_channel_sub_type,
+  campaign.bidding_strategy_type,
+
+  ad_group.id,
+  ad_group.name,
+  ad_group.status,
+  ad_group.type,
+
+  ad_group_criterion.criterion_id,
+  ad_group_criterion.gender.type,
+  ad_group_criterion.status,
+
+  metrics.impressions,
+  metrics.clicks,
+  metrics.ctr,
+  metrics.cost_micros,
+
+  metrics.average_cpc,
+  metrics.average_cpm,
+  metrics.average_cost,
+
+  metrics.interactions,
+  metrics.interaction_rate,
+
+  metrics.engagements,
+  metrics.engagement_rate,
+
+  metrics.video_trueview_views,
+  metrics.video_trueview_view_rate,
+
+  metrics.conversions,
+  metrics.conversions_from_interactions_rate,
+  metrics.cost_per_conversion,
+  metrics.conversions_value,
+
+  metrics.all_conversions,
+  metrics.all_conversions_value,
+  metrics.all_conversions_from_interactions_rate,
+  metrics.cost_per_all_conversions,
+
+  metrics.view_through_conversions
+FROM gender_view
+WHERE segments.date BETWEEN '{date_since}' AND '{date_until}'
+"""
+
+DIRECT_IMAGE_AD_CREATIVE_QUERY = """
+SELECT
+  customer.id,
+  customer.descriptive_name,
+
+  campaign.id,
+  campaign.name,
+  campaign.status,
+  campaign.advertising_channel_type,
+  campaign.advertising_channel_sub_type,
+
+  ad_group.id,
+  ad_group.name,
+  ad_group.status,
+
+  ad_group_ad.ad.id,
+  ad_group_ad.ad.name,
+  ad_group_ad.ad.type,
+  ad_group_ad.status,
+
+  ad_group_ad.ad.image_ad.name,
+  ad_group_ad.ad.image_ad.image_url,
+  ad_group_ad.ad.image_ad.preview_image_url,
+  ad_group_ad.ad.image_ad.mime_type,
+  ad_group_ad.ad.image_ad.pixel_width,
+  ad_group_ad.ad.image_ad.pixel_height,
+  ad_group_ad.ad.image_ad.preview_pixel_width,
+  ad_group_ad.ad.image_ad.preview_pixel_height
+
+FROM ad_group_ad
+WHERE campaign.status != 'REMOVED'
+AND ad_group_ad.ad.type = 'IMAGE_AD'
+"""
+
+
+DIRECT_VIDEO_RESPONSIVE_AD_CREATIVE_QUERY = """
+SELECT
+  customer.id,
+  customer.descriptive_name,
+
+  campaign.id,
+  campaign.name,
+  campaign.status,
+  campaign.advertising_channel_type,
+  campaign.advertising_channel_sub_type,
+
+  ad_group.id,
+  ad_group.name,
+  ad_group.status,
+
+  ad_group_ad.ad.id,
+  ad_group_ad.ad.name,
+  ad_group_ad.ad.type,
+  ad_group_ad.status,
+
+  ad_group_ad.ad.video_responsive_ad.videos
+
+FROM ad_group_ad
+WHERE campaign.status != 'REMOVED'
+AND ad_group_ad.ad.type = 'VIDEO_RESPONSIVE_AD'
+"""
+
+
+YOUTUBE_VIDEO_ASSET_QUERY_TEMPLATE = """
+SELECT
+  asset.id,
+  asset.name,
+  asset.type,
+  asset.youtube_video_asset.youtube_video_id,
+  asset.youtube_video_asset.youtube_video_title
+FROM asset
+WHERE asset.id IN ({asset_ids})
+"""

@@ -30,14 +30,10 @@ DAILY_TABLES = [
 ]
 
 
+DAILY_GEO_TABLE = "google_ads_geo_daily_region_level"
+
 DAILY_GEO_TABLES = [
-    "google_ads_sales_geo_daily_region_level",
-    "google_ads_leads_geo_daily_region_level",
-    "google_ads_website_traffic_geo_daily_region_level",
-    "google_ads_app_promotion_geo_daily_region_level",
-    "google_ads_youtube_reach_views_engagement_geo_daily_region_level",
-    "google_ads_store_visits_promotions_geo_daily_region_level",
-    "google_ads_no_goal_geo_daily_region_level",
+    DAILY_GEO_TABLE,
 ]
 
 DAILY_CAMPAIGN_TABLES = [
@@ -53,6 +49,8 @@ DAILY_CAMPAIGN_TABLES = [
 DAILY_SEARCH_TERM_TABLE = "google_ads_daily_search_term_level"
 
 CREATIVE_ASSET_TABLE = "google_ads_creative_assets"
+
+GENDER_DAILY_TABLE = "google_ads_gender_daily_level"
 
 
 # Старые имена оставляем для совместимости
@@ -869,6 +867,65 @@ CREATIVE_ASSET_COLUMNS = [
     "loaded_at",
 ]
 
+GENDER_DAILY_TABLE_COLUMNS = [
+    "date_start",
+    "date_stop",
+
+    "customer_id",
+    "customer_name",
+
+    "campaign_id",
+    "campaign_name",
+    "campaign_status",
+    "campaign_primary_status",
+    "advertising_channel_type",
+    "advertising_channel_sub_type",
+    "google_ads_goal_type",
+
+    "ad_group_id",
+    "ad_group_name",
+    "ad_group_status",
+    "ad_group_type",
+
+    "gender_criterion_id",
+    "gender_type",
+    "gender_status",
+
+    "device",
+    "ad_network_type",
+
+    "impressions",
+    "clicks",
+    "ctr",
+
+    "spend",
+    "average_cpc",
+    "average_cpm",
+    "average_cost",
+
+    "interactions",
+    "interaction_rate",
+
+    "engagements",
+    "engagement_rate",
+
+    "video_views",
+    "view_rate",
+
+    "conversions",
+    "conversion_rate",
+    "cost_per_conversion",
+    "conversions_value",
+
+    "all_conversions",
+    "all_conversions_value",
+    "all_conversion_rate",
+    "cost_per_all_conversions",
+
+    "view_through_conversions",
+
+    "loaded_at",
+]
 
 GOAL_TABLE_COLUMNS = HOURLY_TABLE_COLUMNS
 
@@ -986,18 +1043,19 @@ def delete_daily_tables_for_period(
     )
 
 
-def delete_daily_geo_tables_for_period(
+def delete_daily_geo_table_for_period(
     *,
     customer_id: str,
     date_since: str,
     date_until: str,
 ) -> None:
     """
-    Удаляет старые daily_geo formatted-строки за период.
+    Удаляет старые geo_daily_region_level строки за период
+    из единой geo-таблицы.
     raw_data не трогаем.
     """
     _delete_tables_for_period(
-        table_names=DAILY_GEO_TABLES,
+        table_names=[DAILY_GEO_TABLE],
         customer_id=customer_id,
         date_since=date_since,
         date_until=date_until,
@@ -1058,6 +1116,32 @@ def delete_creative_assets_for_customer(
     client.command(sql)
 
 
+def delete_gender_daily_table_for_period(
+    *,
+    customer_id: str,
+    date_since: str,
+    date_until: str,
+) -> None:
+    client = get_client()
+
+    query = f"""
+    ALTER TABLE {config.CLICKHOUSE_DB}.{GENDER_DAILY_TABLE}
+    DELETE
+    WHERE customer_id = %(customer_id)s
+    AND toDate(date_start) BETWEEN toDate(%(date_since)s)
+    AND toDate(%(date_until)s)
+    """
+
+    client.command(
+        query,
+        parameters={
+            "customer_id": customer_id,
+            "date_since": date_since,
+            "date_until": date_until,
+        },
+    )
+
+
 def insert_goal_rows(
     *,
     table_name: str,
@@ -1106,22 +1190,18 @@ def insert_daily_rows(
 
 def insert_daily_geo_rows(
     *,
-    table_name: str,
     rows: list[list[Any]],
 ) -> None:
     """
-    Вставка в daily_geo таблицы.
+    Вставка в единую geo_daily_region_level таблицу.
     """
     if not rows:
         return
 
-    if table_name not in DAILY_GEO_TABLES:
-        raise ValueError(f"Unknown daily_geo table: {table_name}")
-
     client = get_client()
 
     client.insert(
-        table_name,
+        DAILY_GEO_TABLE,
         rows,
         column_names=DAILY_GEO_TABLE_COLUMNS,
     )
@@ -1185,4 +1265,20 @@ def insert_creative_asset_rows(
         CREATIVE_ASSET_TABLE,
         rows,
         column_names=CREATIVE_ASSET_COLUMNS,
+    )
+
+
+def insert_gender_daily_rows(
+    *,
+    rows: list[list],
+) -> None:
+    if not rows:
+        return
+
+    client = get_client()
+
+    client.insert(
+        table=f"{config.CLICKHOUSE_DB}.{GENDER_DAILY_TABLE}",
+        data=rows,
+        column_names=GENDER_DAILY_TABLE_COLUMNS,
     )

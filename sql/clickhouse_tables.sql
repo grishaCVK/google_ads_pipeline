@@ -514,7 +514,7 @@ AS google_ads_website_traffic_daily_ad_level;
 -- потому что они не проходят на уровне FROM geographic_view.
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS google_ads_website_traffic_geo_daily_region_level
+CREATE TABLE IF NOT EXISTS google_ads_geo_daily_region_level
 (
     -- time
     date_start DateTime('Asia/Almaty'),
@@ -634,30 +634,6 @@ ORDER BY (
     ifNull(geo_region_criterion_id, ''),
     ifNull(geo_city_criterion_id, '')
 );
-
-
-CREATE TABLE IF NOT EXISTS google_ads_sales_geo_daily_region_level
-AS google_ads_website_traffic_geo_daily_region_level;
-
-
-CREATE TABLE IF NOT EXISTS google_ads_leads_geo_daily_region_level
-AS google_ads_website_traffic_geo_daily_region_level;
-
-
-CREATE TABLE IF NOT EXISTS google_ads_app_promotion_geo_daily_region_level
-AS google_ads_website_traffic_geo_daily_region_level;
-
-
-CREATE TABLE IF NOT EXISTS google_ads_youtube_reach_views_engagement_geo_daily_region_level
-AS google_ads_website_traffic_geo_daily_region_level;
-
-
-CREATE TABLE IF NOT EXISTS google_ads_store_visits_promotions_geo_daily_region_level
-AS google_ads_website_traffic_geo_daily_region_level;
-
-
-CREATE TABLE IF NOT EXISTS google_ads_no_goal_geo_daily_region_level
-AS google_ads_website_traffic_geo_daily_region_level;
 
 -- ============================================================
 -- 4. DAILY CAMPAIGN LEVEL TABLES

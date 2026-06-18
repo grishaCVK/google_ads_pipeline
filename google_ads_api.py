@@ -13,18 +13,31 @@ import queries
 
 
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
+_SUFFIX = "_staging"
+_HOURLY = "_hourly_campaign_level"
 
-SALES_HOURLY_TABLE = "google_ads_sales_hourly_campaign_level"
-LEADS_HOURLY_TABLE = "google_ads_leads_hourly_campaign_level"
-WEBSITE_TRAFFIC_HOURLY_TABLE = "google_ads_website_traffic_hourly_campaign_level"
-APP_PROMOTION_HOURLY_TABLE = "google_ads_app_promotion_hourly_campaign_level"
+SALES_HOURLY_TABLE = (
+    "google_ads_sales_hourly_campaign_level_staging"
+)
+LEADS_HOURLY_TABLE = (
+    "google_ads_leads_hourly_campaign_level_staging"
+)
+WEBSITE_TRAFFIC_HOURLY_TABLE = (
+    "google_ads_website_traffic_hourly_campaign_level_staging"
+)
+APP_PROMOTION_HOURLY_TABLE = (
+    "google_ads_app_promotion_hourly_campaign_level_staging"
+)
 YOUTUBE_REACH_VIEWS_ENGAGEMENT_HOURLY_TABLE = (
-    "google_ads_youtube_reach_views_engagement_hourly_campaign_level"
+    "google_ads_youtube_reach_views_engagement"
+    "_hourly_campaign_level_staging"
 )
 STORE_VISITS_PROMOTIONS_HOURLY_TABLE = (
-    "google_ads_store_visits_promotions_hourly_campaign_level"
+    "google_ads_store_visits_promotions_hourly_campaign_level_staging"
 )
-NO_GOAL_HOURLY_TABLE = "google_ads_no_goal_hourly_campaign_level"
+NO_GOAL_HOURLY_TABLE = (
+    "google_ads_no_goal_hourly_campaign_level_staging"
+)
 
 
 GOAL_PRIORITY = {
@@ -407,75 +420,75 @@ def get_target_table(
 
 
 def get_daily_target_table(
-    row: Any,
+    row,
     *,
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
-) -> str:
+    campaign_goal_hints_by_campaign=None,
+):
     hourly_table = get_target_table(
         row,
-        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
+        campaign_goal_hints_by_campaign=(
+            campaign_goal_hints_by_campaign
+        ),
     )
-
     return hourly_table.replace(
-        "_hourly_campaign_level",
-        "_daily_ad_level",
+        "_hourly_campaign_level_staging",
+        "_daily_ad_level_staging",
     )
 
 
 def get_daily_geo_target_table(
-    row: Any,
+    row,
     *,
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
-) -> str:
+    campaign_goal_hints_by_campaign=None,
+):
     hourly_table = get_target_table(
         row,
-        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
+        campaign_goal_hints_by_campaign=(
+            campaign_goal_hints_by_campaign
+        ),
     )
-
     return hourly_table.replace(
-        "_hourly_campaign_level",
-        "_geo_daily_region_level",
+        "_hourly_campaign_level_staging",
+        "_geo_daily_region_level_staging",
     )
 
 
 def get_daily_campaign_target_table(
-    row: Any,
+    row,
     *,
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
-) -> str:
+    campaign_goal_hints_by_campaign=None,
+):
     hourly_table = get_target_table(
         row,
-        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
+        campaign_goal_hints_by_campaign=(
+            campaign_goal_hints_by_campaign
+        ),
     )
-
     return hourly_table.replace(
-        "_hourly_campaign_level",
-        "_daily_campaign_level",
+        "_hourly_campaign_level_staging",
+        "_daily_campaign_level_staging",
     )
 
 
 def get_google_ads_goal_type(table_name: str) -> str:
+    _h = _HOURLY + _SUFFIX
     mapping = {
-        "google_ads_sales_hourly_campaign_level": "sales",
-        "google_ads_leads_hourly_campaign_level": "leads",
-        "google_ads_website_traffic_hourly_campaign_level": "website_traffic",
-        "google_ads_app_promotion_hourly_campaign_level": "app_promotion",
-        "google_ads_youtube_reach_views_engagement_hourly_campaign_level": (
-            "youtube_reach_views_engagement"
-        ),
-        "google_ads_store_visits_promotions_hourly_campaign_level": (
-            "store_visits_promotions"
-        ),
-        "google_ads_no_goal_hourly_campaign_level": "no_goal",
+        "google_ads_sales" + _h: "sales",
+        "google_ads_leads" + _h: "leads",
+        "google_ads_website_traffic" + _h: "website_traffic",
+        "google_ads_app_promotion" + _h: "app_promotion",
+        "google_ads_youtube_reach_views_engagement"
+        + _h: "youtube_reach_views_engagement",
+        "google_ads_store_visits_promotions"
+        + _h: "store_visits_promotions",
+        "google_ads_no_goal" + _h: "no_goal",
     }
-
     hourly_table_name = (
         table_name
-        .replace("_geo_daily_region_level", "_hourly_campaign_level")
-        .replace("_daily_campaign_level", "_hourly_campaign_level")
-        .replace("_daily_ad_level", "_hourly_campaign_level")
+        .replace("_geo_daily_region_level" + _SUFFIX, _h)
+        .replace("_daily_campaign_level" + _SUFFIX, _h)
+        .replace("_daily_ad_level" + _SUFFIX, _h)
     )
-
     return mapping.get(hourly_table_name, "no_goal")
 
 
@@ -3332,7 +3345,6 @@ def fetch_daily_search_term_data(
                     )
                 )
 
-
     except GoogleAdsException as ex:
         print("Google Ads daily search term request failed")
         print(f"Request ID: {ex.request_id}")
@@ -3415,7 +3427,8 @@ def fetch_creative_assets_data(
             raise
 
     # Direct VIDEO_RESPONSIVE_AD отдельно:
-    # сначала собираем video asset ids, потом одним/несколькими запросами получаем YouTube metadata.
+    # сначала собираем video asset ids, 
+    # потом одним/несколькими запросами получаем YouTube metadata.
     direct_video_rows: list[Any] = []
     direct_video_asset_ids: set[str] = set()
 

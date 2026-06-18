@@ -8,54 +8,68 @@ import clickhouse_connect
 import config
 
 
-HOURLY_TABLES = [
-    "google_ads_sales_hourly_campaign_level",
-    "google_ads_leads_hourly_campaign_level",
-    "google_ads_website_traffic_hourly_campaign_level",
-    "google_ads_app_promotion_hourly_campaign_level",
-    "google_ads_youtube_reach_views_engagement_hourly_campaign_level",
-    "google_ads_store_visits_promotions_hourly_campaign_level",
-    "google_ads_no_goal_hourly_campaign_level",
-]
+# ============================================================
+# STAGING table names (пайплайн пишет сюда)
+# ============================================================
 
+HOURLY_TABLES = [
+    "google_ads_sales_hourly_campaign_level_staging",
+    "google_ads_leads_hourly_campaign_level_staging",
+    "google_ads_website_traffic_hourly_campaign_level_staging",
+    "google_ads_app_promotion_hourly_campaign_level_staging",
+    "google_ads_youtube_reach_views_engagement_hourly_campaign_level_staging",
+    "google_ads_store_visits_promotions_hourly_campaign_level_staging",
+    "google_ads_no_goal_hourly_campaign_level_staging",
+]
 
 DAILY_TABLES = [
-    "google_ads_sales_daily_ad_level",
-    "google_ads_leads_daily_ad_level",
-    "google_ads_website_traffic_daily_ad_level",
-    "google_ads_app_promotion_daily_ad_level",
-    "google_ads_youtube_reach_views_engagement_daily_ad_level",
-    "google_ads_store_visits_promotions_daily_ad_level",
-    "google_ads_no_goal_daily_ad_level",
+    "google_ads_sales_daily_ad_level_staging",
+    "google_ads_leads_daily_ad_level_staging",
+    "google_ads_website_traffic_daily_ad_level_staging",
+    "google_ads_app_promotion_daily_ad_level_staging",
+    "google_ads_youtube_reach_views_engagement_daily_ad_level_staging",
+    "google_ads_store_visits_promotions_daily_ad_level_staging",
+    "google_ads_no_goal_daily_ad_level_staging",
 ]
 
-
-DAILY_GEO_TABLE = "google_ads_geo_daily_region_level"
+DAILY_GEO_TABLE = "google_ads_geo_daily_region_level_staging"
 
 DAILY_GEO_TABLES = [
     DAILY_GEO_TABLE,
 ]
 
 DAILY_CAMPAIGN_TABLES = [
-    "google_ads_sales_daily_campaign_level",
-    "google_ads_leads_daily_campaign_level",
-    "google_ads_website_traffic_daily_campaign_level",
-    "google_ads_app_promotion_daily_campaign_level",
-    "google_ads_youtube_reach_views_engagement_daily_campaign_level",
-    "google_ads_store_visits_promotions_daily_campaign_level",
-    "google_ads_no_goal_daily_campaign_level",
+    "google_ads_sales_daily_campaign_level_staging",
+    "google_ads_leads_daily_campaign_level_staging",
+    "google_ads_website_traffic_daily_campaign_level_staging",
+    "google_ads_app_promotion_daily_campaign_level_staging",
+    "google_ads_youtube_reach_views_engagement_daily_campaign_level_staging",
+    "google_ads_store_visits_promotions_daily_campaign_level_staging",
+    "google_ads_no_goal_daily_campaign_level_staging",
 ]
 
-DAILY_SEARCH_TERM_TABLE = "google_ads_daily_search_term_level"
+DAILY_SEARCH_TERM_TABLE = "google_ads_daily_search_term_level_staging"
 
-CREATIVE_ASSET_TABLE = "google_ads_creative_assets"
+CREATIVE_ASSET_TABLE = "google_ads_creative_assets_staging"
 
-GENDER_DAILY_TABLE = "google_ads_gender_daily_level"
-
+GENDER_DAILY_TABLE = "google_ads_gender_daily_level_staging"
 
 # Старые имена оставляем для совместимости
 GOAL_TABLES = HOURLY_TABLES
 
+# ============================================================
+# Маппинг: staging_table_name -> hourly таблица (для insert func)
+# ============================================================
+
+# Маппинг hourly staging -> old hourly (для insert_goal_rows validation)
+_HOURLY_TABLES_SET = set(HOURLY_TABLES)
+_DAILY_TABLES_SET = set(DAILY_TABLES)
+_DAILY_CAMPAIGN_TABLES_SET = set(DAILY_CAMPAIGN_TABLES)
+
+
+# ============================================================
+# Columns — не меняются, структура та же что в старых таблицах
+# ============================================================
 
 HOURLY_TABLE_COLUMNS = [
     "date_start",
@@ -859,7 +873,7 @@ CREATIVE_ASSET_COLUMNS = [
     "image_height",
     "image_mime_type",
     "image_file_size",
-    
+
     "youtube_video_id",
     "youtube_video_url",
     "youtube_video_title",
@@ -943,15 +957,34 @@ RAW_COLUMNS = [
 ]
 
 
-def get_client():
+# ============================================================
+# Client — теперь указываем STAGING БД по умолчанию
+# ============================================================
+
+def get_client(database: str | None = None):
     return clickhouse_connect.get_client(
         host=config.CLICKHOUSE_HOST,
         port=config.CLICKHOUSE_PORT,
         username=config.CLICKHOUSE_USER,
         password=config.CLICKHOUSE_PASSWORD,
-        database=config.CLICKHOUSE_DB,
+        database=database or config.CLICKHOUSE_STAGING_DB,
     )
 
+
+def get_raw_client():
+    """Клиент для записи raw_data — всегда в RAW БД."""
+    return clickhouse_connect.get_client(
+        host=config.CLICKHOUSE_HOST,
+        port=config.CLICKHOUSE_PORT,
+        username=config.CLICKHOUSE_USER,
+        password=config.CLICKHOUSE_PASSWORD,
+        database=config.CLICKHOUSE_RAW_DB,
+    )
+
+
+# ============================================================
+# RAW insert
+# ============================================================
 
 def insert_raw_data(
     *,
@@ -961,7 +994,7 @@ def insert_raw_data(
     response_data: dict[str, Any],
     request_params: dict[str, Any],
 ) -> None:
-    client = get_client()
+    client = get_raw_client()
 
     row = [
         str(uuid.uuid4()),
@@ -982,14 +1015,20 @@ def insert_raw_data(
     )
 
 
+# ============================================================
+# DELETE helpers — теперь используют STAGING БД
+# ============================================================
+
 def _delete_tables_for_period(
     *,
     table_names: list[str],
     customer_id: str,
     date_since: str,
     date_until: str,
+    database: str | None = None,
 ) -> None:
-    client = get_client()
+    client = get_client(database)
+    db = database or config.CLICKHOUSE_STAGING_DB
 
     date_start = f"{date_since} 00:00:00"
     date_until_exclusive = (
@@ -998,12 +1037,11 @@ def _delete_tables_for_period(
 
     for table_name in table_names:
         sql = f"""
-        ALTER TABLE {config.CLICKHOUSE_DB}.{table_name}
+        ALTER TABLE {db}.{table_name}
         DELETE WHERE customer_id = '{customer_id}'
           AND date_start >= toDateTime('{date_start}', 'Asia/Almaty')
           AND date_start < toDateTime('{date_until_exclusive}', 'Asia/Almaty')
         """
-
         client.command(sql)
 
 
@@ -1013,10 +1051,6 @@ def delete_goal_tables_for_period(
     date_since: str,
     date_until: str,
 ) -> None:
-    """
-    Удаляет старые hourly formatted-строки за период.
-    raw_data не трогаем.
-    """
     _delete_tables_for_period(
         table_names=HOURLY_TABLES,
         customer_id=customer_id,
@@ -1031,10 +1065,6 @@ def delete_daily_tables_for_period(
     date_since: str,
     date_until: str,
 ) -> None:
-    """
-    Удаляет старые daily formatted-строки за период.
-    raw_data не трогаем.
-    """
     _delete_tables_for_period(
         table_names=DAILY_TABLES,
         customer_id=customer_id,
@@ -1049,11 +1079,6 @@ def delete_daily_geo_table_for_period(
     date_since: str,
     date_until: str,
 ) -> None:
-    """
-    Удаляет старые geo_daily_region_level строки за период
-    из единой geo-таблицы.
-    raw_data не трогаем.
-    """
     _delete_tables_for_period(
         table_names=[DAILY_GEO_TABLE],
         customer_id=customer_id,
@@ -1068,10 +1093,6 @@ def delete_daily_campaign_tables_for_period(
     date_since: str,
     date_until: str,
 ) -> None:
-    """
-    Удаляет старые daily_campaign_level formatted-строки за период.
-    raw_data не трогаем.
-    """
     _delete_tables_for_period(
         table_names=DAILY_CAMPAIGN_TABLES,
         customer_id=customer_id,
@@ -1086,10 +1107,6 @@ def delete_daily_search_term_table_for_period(
     date_since: str,
     date_until: str,
 ) -> None:
-    """
-    Удаляет старые daily_search_term_level строки за период.
-    raw_data не трогаем.
-    """
     _delete_tables_for_period(
         table_names=[DAILY_SEARCH_TERM_TABLE],
         customer_id=customer_id,
@@ -1102,17 +1119,12 @@ def delete_creative_assets_for_customer(
     *,
     customer_id: str,
 ) -> None:
-    """
-    Удаляет старые creative assets по customer_id.
-    raw_data не трогаем.
-    """
     client = get_client()
 
     sql = f"""
-    ALTER TABLE {config.CLICKHOUSE_DB}.{CREATIVE_ASSET_TABLE}
+    ALTER TABLE {config.CLICKHOUSE_STAGING_DB}.{CREATIVE_ASSET_TABLE}
     DELETE WHERE customer_id = '{customer_id}'
     """
-
     client.command(sql)
 
 
@@ -1125,7 +1137,7 @@ def delete_gender_daily_table_for_period(
     client = get_client()
 
     query = f"""
-    ALTER TABLE {config.CLICKHOUSE_DB}.{GENDER_DAILY_TABLE}
+    ALTER TABLE {config.CLICKHOUSE_STAGING_DB}.{GENDER_DAILY_TABLE}
     DELETE
     WHERE customer_id = %(customer_id)s
     AND toDate(date_start) BETWEEN toDate(%(date_since)s)
@@ -1142,22 +1154,22 @@ def delete_gender_daily_table_for_period(
     )
 
 
+# ============================================================
+# INSERT helpers — теперь используют STAGING БД
+# ============================================================
+
 def insert_goal_rows(
     *,
     table_name: str,
     rows: list[list[Any]],
 ) -> None:
-    """
-    Вставка в hourly таблицы.
-    """
     if not rows:
         return
 
-    if table_name not in HOURLY_TABLES:
-        raise ValueError(f"Unknown hourly table: {table_name}")
+    if table_name not in _HOURLY_TABLES_SET:
+        raise ValueError(f"Unknown hourly staging table: {table_name}")
 
     client = get_client()
-
     client.insert(
         table_name,
         rows,
@@ -1170,17 +1182,13 @@ def insert_daily_rows(
     table_name: str,
     rows: list[list[Any]],
 ) -> None:
-    """
-    Вставка в daily таблицы.
-    """
     if not rows:
         return
 
-    if table_name not in DAILY_TABLES:
-        raise ValueError(f"Unknown daily table: {table_name}")
+    if table_name not in _DAILY_TABLES_SET:
+        raise ValueError(f"Unknown daily staging table: {table_name}")
 
     client = get_client()
-
     client.insert(
         table_name,
         rows,
@@ -1192,14 +1200,10 @@ def insert_daily_geo_rows(
     *,
     rows: list[list[Any]],
 ) -> None:
-    """
-    Вставка в единую geo_daily_region_level таблицу.
-    """
     if not rows:
         return
 
     client = get_client()
-
     client.insert(
         DAILY_GEO_TABLE,
         rows,
@@ -1212,17 +1216,13 @@ def insert_daily_campaign_rows(
     table_name: str,
     rows: list[list[Any]],
 ) -> None:
-    """
-    Вставка в daily_campaign_level таблицы.
-    """
     if not rows:
         return
 
-    if table_name not in DAILY_CAMPAIGN_TABLES:
-        raise ValueError(f"Unknown daily_campaign_level table: {table_name}")
+    if table_name not in _DAILY_CAMPAIGN_TABLES_SET:
+        raise ValueError(f"Unknown daily_campaign staging table: {table_name}")
 
     client = get_client()
-
     client.insert(
         table_name,
         rows,
@@ -1234,14 +1234,10 @@ def insert_daily_search_term_rows(
     *,
     rows: list[list[Any]],
 ) -> None:
-    """
-    Вставка в google_ads_daily_search_term_level.
-    """
     if not rows:
         return
 
     client = get_client()
-
     client.insert(
         DAILY_SEARCH_TERM_TABLE,
         rows,
@@ -1253,14 +1249,10 @@ def insert_creative_asset_rows(
     *,
     rows: list[list[Any]],
 ) -> None:
-    """
-    Вставка в google_ads_creative_assets.
-    """
     if not rows:
         return
 
     client = get_client()
-
     client.insert(
         CREATIVE_ASSET_TABLE,
         rows,
@@ -1276,9 +1268,8 @@ def insert_gender_daily_rows(
         return
 
     client = get_client()
-
     client.insert(
-        table=f"{config.CLICKHOUSE_DB}.{GENDER_DAILY_TABLE}",
+        table=f"{config.CLICKHOUSE_STAGING_DB}.{GENDER_DAILY_TABLE}",
         data=rows,
         column_names=GENDER_DAILY_TABLE_COLUMNS,
     )

@@ -31,7 +31,11 @@ CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "host.docker.internal")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", "8123"))
 CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "clickhouse")
-CLICKHOUSE_DB = os.getenv("CLICKHOUSE_DB", "google_ads")
+
+CLICKHOUSE_RAW_DB = os.getenv("CLICKHOUSE_RAW_DB", "google_ads_raw")
+CLICKHOUSE_STAGING_DB = os.getenv("CLICKHOUSE_STAGING_DB", "google_ads_staging")
+CLICKHOUSE_CORE_DB = os.getenv("CLICKHOUSE_CORE_DB", "google_ads_core")
+CLICKHOUSE_METADATA_DB = os.getenv("CLICKHOUSE_METADATA_DB", "etl_metadata")
 
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "host.docker.internal")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5433"))

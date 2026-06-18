@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo
 import clickhouse_db
 import config
 import google_ads_api
+import etl_logger
+import core_loader
 
 
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
@@ -214,493 +216,489 @@ def run_pipeline_for_period(
     customer_id: str,
     date_since: str,
     date_until: str,
+    run_id: str,
+    run_type: str = "daily",
 ) -> None:
     print(
         f"Start Google Ads period: "
-        f"customer_id={customer_id}, {date_since} -> {date_until}"
-    )
-
-    # 1. Hourly: campaign + hour + device + network.
-    hourly_response_data, hourly_grouped_rows = (
-        google_ads_api.fetch_ad_hourly_data(
-            customer_id=customer_id,
-            date_since=date_since,
-            date_until=date_until,
-        )
-    )
-
-    print(
-        f"Fetched Google Ads hourly data: "
         f"customer_id={customer_id}, "
-        f"rows={hourly_response_data['rows_count']}"
+        f"{date_since} -> {date_until}"
     )
-
-    # 2. Daily ad: campaign + ad_group + ad + device + network.
-    daily_response_data, daily_grouped_rows = (
-        google_ads_api.fetch_ad_group_ad_daily_data(
-            customer_id=customer_id,
-            date_since=date_since,
-            date_until=date_until,
-        )
-    )
-
-    print(
-        f"Fetched Google Ads daily ad data: "
-        f"customer_id={customer_id}, "
-        f"rows={daily_response_data['rows_count']}"
-    )
-
-    # 3. Daily geo: campaign + device + network + country + region + city.
-    daily_geo_response_data, daily_geo_rows = (
-        google_ads_api.fetch_geo_daily_data(
-            customer_id=customer_id,
-            date_since=date_since,
-            date_until=date_until,
-        )
-    )
-
-    print(
-        f"Fetched Google Ads daily geo data: "
-        f"customer_id={customer_id}, "
-        f"rows={daily_geo_response_data['rows_count']}"
-    )
-
-    # 4. Daily campaign: campaign + date.
-    daily_campaign_response_data, daily_campaign_grouped_rows = (
-        google_ads_api.fetch_daily_campaign_data(
-            customer_id=customer_id,
-            date_since=date_since,
-            date_until=date_until,
-        )
-    )
-
-    print(
-        f"Fetched Google Ads daily campaign data: "
-        f"customer_id={customer_id}, "
-        f"rows={daily_campaign_response_data['rows_count']}"
-    )
-
-    # 5. Daily search terms: campaign + ad_group + search_term + keyword + device + network.
-    daily_search_term_response_data, daily_search_term_rows = (
-        google_ads_api.fetch_daily_search_term_data(
-            customer_id=customer_id,
-            date_since=date_since,
-            date_until=date_until,
-        )
-    )
-
-    print(
-        f"Fetched Google Ads daily search term data: "
-        f"customer_id={customer_id}, "
-        f"rows={daily_search_term_response_data['rows_count']}"
-    )
-
-    # 6. Daily gender: campaign + ad_group + gender + device + network.
-    gender_daily_response_data, gender_daily_rows = (
-        google_ads_api.fetch_gender_daily_data(
-            customer_id=customer_id,
-            date_since=date_since,
-            date_until=date_until,
-        )
-    )
-
-    print(
-        f"Fetched Google Ads gender daily data: "
-        f"customer_id={customer_id}, "
-        f"rows={gender_daily_response_data['rows_count']}"
-    )
-
-    # 6. Creative assets: campaign/ad/ad_group/asset_group -> asset.
-    # Creative assets не являются дневной таблицей, поэтому на большом
-    # backfill их не дергаем каждый день.
-    fetch_creative_assets = get_bool_env(
-        "GOOGLE_FETCH_CREATIVE_ASSETS",
-        default=True,
-    )
-
-    creative_assets_response_data = {
-        "rows_count": 0,
-        "data": [],
-        "skipped": True,
-        "reason": "GOOGLE_FETCH_CREATIVE_ASSETS=0",
-    }
-    creative_asset_rows: list[list] = []
-
-    if fetch_creative_assets:
-        creative_assets_response_data, creative_asset_rows = (
-            google_ads_api.fetch_creative_assets_data(
+ 
+    total_raw_rows = 0
+    total_staging_rows = 0
+ 
+    # ----------------------------------------------------------
+    # Шаг 1: fetch_raw — выгрузка из Google API
+    # ----------------------------------------------------------
+    with etl_logger.etl_step(
+        run_id=run_id,
+        step_name="fetch_raw",
+        step_order=1,
+        target_database=config.CLICKHOUSE_RAW_DB,
+        target_table="raw_data",
+    ) as step:
+ 
+        hourly_response_data, hourly_grouped_rows = (
+            google_ads_api.fetch_ad_hourly_data(
                 customer_id=customer_id,
+                date_since=date_since,
+                date_until=date_until,
             )
         )
-
-        print(
-            f"Fetched Google Ads creative assets data: "
-            f"customer_id={customer_id}, "
-            f"rows={creative_assets_response_data['rows_count']}"
+ 
+        daily_response_data, daily_grouped_rows = (
+            google_ads_api.fetch_ad_group_ad_daily_data(
+                customer_id=customer_id,
+                date_since=date_since,
+                date_until=date_until,
+            )
         )
-    else:
-        print(
-            f"Google Ads creative assets skipped: "
-            f"customer_id={customer_id}, "
-            f"GOOGLE_FETCH_CREATIVE_ASSETS=0"
+ 
+        daily_geo_response_data, daily_geo_rows = (
+            google_ads_api.fetch_geo_daily_data(
+                customer_id=customer_id,
+                date_since=date_since,
+                date_until=date_until,
+            )
         )
-
-    # 7. raw_data append-only. Старые raw responses не удаляем.
-    insert_raw_response(
-        customer_id=customer_id,
-        query_name="ad_hourly",
-        query_text=google_ads_api.queries.AD_HOURLY_QUERY,
-        response_data=hourly_response_data,
-        request_params={
-            "customer_id": customer_id,
-            "date_since": date_since,
-            "date_until": date_until,
-            "source": "campaign",
-            "granularity": "hourly_campaign_level",
-            "segments": [
-                "date",
-                "hour",
-                "device",
-                "ad_network_type",
-            ],
-        },
-    )
-
-    print(
-        f"Raw Google Ads hourly data saved: "
-        f"customer_id={customer_id}, "
-        f"rows={hourly_response_data['rows_count']}"
-    )
-
-    insert_raw_response(
-        customer_id=customer_id,
-        query_name="ad_group_ad_daily",
-        query_text=google_ads_api.queries.AD_GROUP_AD_DAILY_QUERY,
-        response_data=daily_response_data,
-        request_params={
-            "customer_id": customer_id,
-            "date_since": date_since,
-            "date_until": date_until,
-            "source": "ad_group_ad",
-            "granularity": "daily_ad_level",
-            "segments": [
-                "date",
-                "device",
-                "ad_network_type",
-            ],
-        },
-    )
-
-    print(
-        f"Raw Google Ads daily ad data saved: "
-        f"customer_id={customer_id}, "
-        f"rows={daily_response_data['rows_count']}"
-    )
-
-    insert_raw_response(
-        customer_id=customer_id,
-        query_name="geo_daily",
-        query_text=google_ads_api.queries.GEO_DAILY_QUERY,
-        response_data=daily_geo_response_data,
-        request_params={
-            "customer_id": customer_id,
-            "date_since": date_since,
-            "date_until": date_until,
-            "source": "geographic_view",
-            "granularity": "geo_daily_region_level",
-            "segments": [
-                "date",
-                "device",
-                "ad_network_type",
-                "geo_target_region",
-                "geo_target_city",
-            ],
-        },
-    )
-
-    print(
-        f"Raw Google Ads daily geo data saved: "
-        f"customer_id={customer_id}, "
-        f"rows={daily_geo_response_data['rows_count']}"
-    )
-
-    insert_raw_response(
-        customer_id=customer_id,
-        query_name="daily_campaign",
-        query_text=google_ads_api.queries.DAILY_CAMPAIGN_QUERY,
-        response_data=daily_campaign_response_data,
-        request_params={
-            "customer_id": customer_id,
-            "date_since": date_since,
-            "date_until": date_until,
-            "source": "campaign",
-            "granularity": "daily_campaign_level",
-            "segments": [
-                "date",
-            ],
-        },
-    )
-
-    print(
-        f"Raw Google Ads daily campaign data saved: "
-        f"customer_id={customer_id}, "
-        f"rows={daily_campaign_response_data['rows_count']}"
-    )
-
-    insert_raw_response(
-        customer_id=customer_id,
-        query_name="daily_search_term",
-        query_text=google_ads_api.queries.SEARCH_TERM_DAILY_QUERY,
-        response_data=daily_search_term_response_data,
-        request_params={
-            "customer_id": customer_id,
-            "date_since": date_since,
-            "date_until": date_until,
-            "source": "search_term_view",
-            "granularity": "daily_search_term_level",
-            "segments": [
-                "date",
-                "device",
-                "ad_network_type",
-                "keyword",
-            ],
-        },
-    )
-
-    print(
-        f"Raw Google Ads daily search term data saved: "
-        f"customer_id={customer_id}, "
-        f"rows={daily_search_term_response_data['rows_count']}"
-    )
-
-    insert_raw_response(
-        customer_id=customer_id,
-        query_name="gender_daily",
-        query_text=google_ads_api.queries.GENDER_DAILY_QUERY,
-        response_data=gender_daily_response_data,
-        request_params={
-            "customer_id": customer_id,
-            "date_since": date_since,
-            "date_until": date_until,
-            "source": "gender_view",
-            "granularity": "gender_daily_level",
-            "segments": [
-                "date",
-                "device",
-                "ad_network_type",
-                "gender",
-            ],
-        },
-    )
-
-    print(
-        f"Raw Google Ads gender daily data saved: "
-        f"customer_id={customer_id}, "
-        f"rows={gender_daily_response_data['rows_count']}"
-    )
-
-    if fetch_creative_assets:
+ 
+        daily_campaign_response_data, (
+            daily_campaign_grouped_rows
+        ) = (
+            google_ads_api.fetch_daily_campaign_data(
+                customer_id=customer_id,
+                date_since=date_since,
+                date_until=date_until,
+            )
+        )
+ 
+        daily_search_term_response_data, (
+            daily_search_term_rows
+        ) = (
+            google_ads_api.fetch_daily_search_term_data(
+                customer_id=customer_id,
+                date_since=date_since,
+                date_until=date_until,
+            )
+        )
+ 
+        gender_daily_response_data, gender_daily_rows = (
+            google_ads_api.fetch_gender_daily_data(
+                customer_id=customer_id,
+                date_since=date_since,
+                date_until=date_until,
+            )
+        )
+ 
+        fetch_creative_assets = get_bool_env(
+            "GOOGLE_FETCH_CREATIVE_ASSETS",
+            default=True,
+        )
+ 
+        creative_assets_response_data = {
+            "rows_count": 0,
+            "data": [],
+            "skipped": True,
+        }
+        creative_asset_rows: list[list] = []
+ 
+        if fetch_creative_assets:
+            creative_assets_response_data, (
+                creative_asset_rows
+            ) = (
+                google_ads_api.fetch_creative_assets_data(
+                    customer_id=customer_id,
+                )
+            )
+ 
+        raw_count = (
+            hourly_response_data["rows_count"]
+            + daily_response_data["rows_count"]
+            + daily_geo_response_data["rows_count"]
+            + daily_campaign_response_data["rows_count"]
+            + daily_search_term_response_data["rows_count"]
+            + gender_daily_response_data["rows_count"]
+            + creative_assets_response_data["rows_count"]
+        )
+        step["input_rows"] = raw_count
+        step["output_rows"] = raw_count
+        total_raw_rows = raw_count
+ 
+    # ----------------------------------------------------------
+    # Шаг 2: raw_to_staging
+    # ----------------------------------------------------------
+    with etl_logger.etl_step(
+        run_id=run_id,
+        step_name="raw_to_staging",
+        step_order=2,
+        target_database=config.CLICKHOUSE_STAGING_DB,
+    ) as step:
+ 
+        # raw_data (append-only)
         insert_raw_response(
             customer_id=customer_id,
-            query_name="creative_assets",
-            query_text=(
-                google_ads_api.queries.AD_GROUP_AD_ASSET_QUERY
-                + "\n\n-- asset_group_asset\n\n"
-                + google_ads_api.queries.ASSET_GROUP_ASSET_QUERY
-            ),
-            response_data=creative_assets_response_data,
+            query_name="ad_hourly",
+            query_text=google_ads_api.queries.AD_HOURLY_QUERY,
+            response_data=hourly_response_data,
             request_params={
                 "customer_id": customer_id,
-                "source": [
-                    "ad_group_ad_asset_view",
-                    "asset_group_asset",
-                ],
-                "granularity": "creative_asset_level",
+                "date_since": date_since,
+                "date_until": date_until,
+                "source": "campaign",
+                "granularity": "hourly_campaign_level",
             },
         )
-
-    # 8. Перезаписываем formatted hourly_campaign_level.
-    clickhouse_db.delete_goal_tables_for_period(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
-
-    insert_grouped_rows(
-        grouped_rows=hourly_grouped_rows,
-        row_type="hourly",
-        insert_func=clickhouse_db.insert_goal_rows,
-    )
-
-    # 9. Перезаписываем formatted daily_ad_level.
-    clickhouse_db.delete_daily_tables_for_period(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
-
-    insert_grouped_rows(
-        grouped_rows=daily_grouped_rows,
-        row_type="daily",
-        insert_func=clickhouse_db.insert_daily_rows,
-    )
-
-    # 10. Перезаписываем formatted geo_daily_region_level.
-    clickhouse_db.delete_daily_geo_table_for_period(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
-
-    clickhouse_db.insert_daily_geo_rows(
-        rows=daily_geo_rows,
-    )
-
-    print(
-        f"{clickhouse_db.DAILY_GEO_TABLE}: "
-        f"inserted {len(daily_geo_rows)} daily_geo rows"
-    )
-
-    # 11. Перезаписываем formatted daily_campaign_level.
-    clickhouse_db.delete_daily_campaign_tables_for_period(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
-
-    insert_grouped_rows(
-        grouped_rows=daily_campaign_grouped_rows,
-        row_type="daily_campaign",
-        insert_func=clickhouse_db.insert_daily_campaign_rows,
-    )
-
-    # 12. Перезаписываем formatted daily_search_term_level.
-    clickhouse_db.delete_daily_search_term_table_for_period(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
-
-    clickhouse_db.insert_daily_search_term_rows(
-        rows=daily_search_term_rows,
-    )
-
-    print(
-        f"{clickhouse_db.DAILY_SEARCH_TERM_TABLE}: "
-        f"inserted {len(daily_search_term_rows)} daily_search_term rows"
-    )
-
-    # 13. Перезаписываем formatted gender_daily_level.
-    clickhouse_db.delete_gender_daily_table_for_period(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
-
-    clickhouse_db.insert_gender_daily_rows(
-        rows=gender_daily_rows,
-    )
-
-    print(
-        f"{clickhouse_db.GENDER_DAILY_TABLE}: "
-        f"inserted {len(gender_daily_rows)} gender_daily rows"
-    )
-
-    # 13. Перезаписываем creative assets по customer_id.
-    # Если GOOGLE_FETCH_CREATIVE_ASSETS=0, таблицу creative assets НЕ трогаем.
-    if fetch_creative_assets:
-        clickhouse_db.delete_creative_assets_for_customer(
+ 
+        insert_raw_response(
             customer_id=customer_id,
+            query_name="ad_group_ad_daily",
+            query_text=(
+                google_ads_api.queries.AD_GROUP_AD_DAILY_QUERY
+            ),
+            response_data=daily_response_data,
+            request_params={
+                "customer_id": customer_id,
+                "date_since": date_since,
+                "date_until": date_until,
+                "source": "ad_group_ad",
+                "granularity": "daily_ad_level",
+            },
         )
-
-        clickhouse_db.insert_creative_asset_rows(
-            rows=creative_asset_rows,
+ 
+        insert_raw_response(
+            customer_id=customer_id,
+            query_name="geo_daily",
+            query_text=google_ads_api.queries.GEO_DAILY_QUERY,
+            response_data=daily_geo_response_data,
+            request_params={
+                "customer_id": customer_id,
+                "date_since": date_since,
+                "date_until": date_until,
+                "source": "geographic_view",
+                "granularity": "geo_daily_region_level",
+            },
         )
-
-        print(
-            f"{clickhouse_db.CREATIVE_ASSET_TABLE}: "
-            f"inserted {len(creative_asset_rows)} creative_asset rows"
+ 
+        insert_raw_response(
+            customer_id=customer_id,
+            query_name="daily_campaign",
+            query_text=(
+                google_ads_api.queries.DAILY_CAMPAIGN_QUERY
+            ),
+            response_data=daily_campaign_response_data,
+            request_params={
+                "customer_id": customer_id,
+                "date_since": date_since,
+                "date_until": date_until,
+                "source": "campaign",
+                "granularity": "daily_campaign_level",
+            },
         )
-    else:
-        print(
-            f"{clickhouse_db.CREATIVE_ASSET_TABLE}: "
-            f"skipped, existing creative assets were not changed"
+ 
+        insert_raw_response(
+            customer_id=customer_id,
+            query_name="daily_search_term",
+            query_text=(
+                google_ads_api.queries.SEARCH_TERM_DAILY_QUERY
+            ),
+            response_data=daily_search_term_response_data,
+            request_params={
+                "customer_id": customer_id,
+                "date_since": date_since,
+                "date_until": date_until,
+                "source": "search_term_view",
+                "granularity": "daily_search_term_level",
+            },
         )
-
+ 
+        insert_raw_response(
+            customer_id=customer_id,
+            query_name="gender_daily",
+            query_text=(
+                google_ads_api.queries.GENDER_DAILY_QUERY
+            ),
+            response_data=gender_daily_response_data,
+            request_params={
+                "customer_id": customer_id,
+                "date_since": date_since,
+                "date_until": date_until,
+                "source": "gender_view",
+                "granularity": "gender_daily_level",
+            },
+        )
+ 
+        if fetch_creative_assets:
+            insert_raw_response(
+                customer_id=customer_id,
+                query_name="creative_assets",
+                query_text=(
+                    google_ads_api.queries
+                    .AD_GROUP_AD_ASSET_QUERY
+                    + "\n\n-- asset_group_asset\n\n"
+                    + google_ads_api.queries
+                    .ASSET_GROUP_ASSET_QUERY
+                ),
+                response_data=creative_assets_response_data,
+                request_params={
+                    "customer_id": customer_id,
+                    "source": [
+                        "ad_group_ad_asset_view",
+                        "asset_group_asset",
+                    ],
+                    "granularity": "creative_asset_level",
+                },
+            )
+ 
+        # Staging: delete + insert
+        clickhouse_db.delete_goal_tables_for_period(
+            customer_id=customer_id,
+            date_since=date_since,
+            date_until=date_until,
+        )
+        insert_grouped_rows(
+            grouped_rows=hourly_grouped_rows,
+            row_type="hourly",
+            insert_func=clickhouse_db.insert_goal_rows,
+        )
+ 
+        clickhouse_db.delete_daily_tables_for_period(
+            customer_id=customer_id,
+            date_since=date_since,
+            date_until=date_until,
+        )
+        insert_grouped_rows(
+            grouped_rows=daily_grouped_rows,
+            row_type="daily",
+            insert_func=clickhouse_db.insert_daily_rows,
+        )
+ 
+        clickhouse_db.delete_daily_geo_table_for_period(
+            customer_id=customer_id,
+            date_since=date_since,
+            date_until=date_until,
+        )
+        clickhouse_db.insert_daily_geo_rows(
+            rows=daily_geo_rows,
+        )
+ 
+        clickhouse_db.delete_daily_campaign_tables_for_period(
+            customer_id=customer_id,
+            date_since=date_since,
+            date_until=date_until,
+        )
+        insert_grouped_rows(
+            grouped_rows=daily_campaign_grouped_rows,
+            row_type="daily_campaign",
+            insert_func=(
+                clickhouse_db.insert_daily_campaign_rows
+            ),
+        )
+ 
+        clickhouse_db.delete_daily_search_term_table_for_period(
+            customer_id=customer_id,
+            date_since=date_since,
+            date_until=date_until,
+        )
+        clickhouse_db.insert_daily_search_term_rows(
+            rows=daily_search_term_rows,
+        )
+ 
+        clickhouse_db.delete_gender_daily_table_for_period(
+            customer_id=customer_id,
+            date_since=date_since,
+            date_until=date_until,
+        )
+        clickhouse_db.insert_gender_daily_rows(
+            rows=gender_daily_rows,
+        )
+ 
+        if fetch_creative_assets:
+            clickhouse_db.delete_creative_assets_for_customer(
+                customer_id=customer_id,
+            )
+            clickhouse_db.insert_creative_asset_rows(
+                rows=creative_asset_rows,
+            )
+ 
+        staging_count = (
+            sum(
+                len(rows)
+                for rows in hourly_grouped_rows.values()
+            )
+            + sum(
+                len(rows)
+                for rows in daily_grouped_rows.values()
+            )
+            + len(daily_geo_rows)
+            + sum(
+                len(rows)
+                for rows in (
+                    daily_campaign_grouped_rows.values()
+                )
+            )
+            + len(daily_search_term_rows)
+            + len(gender_daily_rows)
+            + len(creative_asset_rows)
+        )
+ 
+        step["input_rows"] = total_raw_rows
+        step["output_rows"] = staging_count
+        total_staging_rows = staging_count
+ 
+    # ----------------------------------------------------------
+    # Шаг 3: staging_to_core
+    # ----------------------------------------------------------
+    total_core_rows = core_loader.run_staging_to_core(
+        run_id=run_id,
+        customer_id=customer_id,
+        date_since=date_since,
+        date_until=date_until,
+        load_creatives=fetch_creative_assets,
+    )
+ 
     print(
         f"Finished Google Ads period: "
-        f"customer_id={customer_id}, {date_since} -> {date_until}"
+        f"customer_id={customer_id}, "
+        f"{date_since} -> {date_until}"
     )
+ 
+    return total_raw_rows, total_staging_rows, total_core_rows
 
 
 def main() -> None:
     config.validate_config()
-
+ 
     customer_ids = config.GOOGLE_ADS_CUSTOMER_IDS
-
+ 
     only_creative_assets = get_bool_env(
         "GOOGLE_ONLY_CREATIVE_ASSETS",
         default=False,
     )
-
+ 
     if only_creative_assets:
         print("Google Ads creative assets only mode started")
-
+ 
         for customer_id in customer_ids:
-            run_creative_assets_only(
-                customer_id=customer_id,
+            run_id = etl_logger.create_run(
+                run_type="creative_assets_only",
+                date_since="1970-01-01",
+                date_until="2099-12-31",
             )
-
+            started_at = datetime.now(ALMATY_TZ)
+ 
+            try:
+                run_creative_assets_only(
+                    customer_id=customer_id,
+                )
+                etl_logger.finish_run(
+                    run_id=run_id,
+                    started_at=started_at,
+                    status="success",
+                )
+            except Exception as e:
+                import traceback
+                etl_logger.finish_run(
+                    run_id=run_id,
+                    started_at=started_at,
+                    status="failed",
+                    error_stage="creative_assets_only",
+                    error_message=str(e),
+                    error_trace=traceback.format_exc(),
+                )
+                raise
+ 
         print("Google Ads creative assets only mode finished")
         return
-
+ 
     if config.BACKFILL_MODE:
         date_since = config.BACKFILL_START_DATE
-        date_until = config.BACKFILL_END_DATE or get_yesterday()
+        date_until = (
+            config.BACKFILL_END_DATE or get_yesterday()
+        )
         batch_days = config.BACKFILL_BATCH_DAYS
-
-        batches = iter_date_batches(
-            start_date=date_since,
-            end_date=date_until,
-            batch_days=batch_days,
-        )
-
-        print(
-            f"Google Ads backfill started: "
-            f"{date_since} -> {date_until}, batches={len(batches)}"
-        )
-
-        for customer_id in customer_ids:
-            for batch_since, batch_until in batches:
-                run_pipeline_for_period(
-                    customer_id=customer_id,
-                    date_since=batch_since,
-                    date_until=batch_until,
-                )
-
-            run_embeddings_after_pipeline(
-                customer_id=customer_id,
-            )
-
-        print("Google Ads backfill finished")
-
+        run_type = "backfill"
     else:
-        yesterday = get_yesterday()
-
-        print(f"Google Ads daily run started: {yesterday}")
-
-        for customer_id in customer_ids:
-            run_pipeline_for_period(
-                customer_id=customer_id,
-                date_since=yesterday,
-                date_until=yesterday,
-            )
-
+        date_since = get_yesterday()
+        date_until = get_yesterday()
+        batch_days = 1
+        run_type = "daily"
+ 
+    batches = iter_date_batches(
+        start_date=date_since,
+        end_date=date_until,
+        batch_days=batch_days,
+    )
+ 
+    print(
+        f"Google Ads {run_type} started: "
+        f"{date_since} -> {date_until}, "
+        f"batches={len(batches)}"
+    )
+ 
+    for customer_id in customer_ids:
+        total_raw = 0
+        total_staging = 0
+        total_core = 0
+ 
+        # Один run_id на весь customer за все батчи
+        run_id = etl_logger.create_run(
+            run_type=run_type,
+            date_since=date_since,
+            date_until=date_until,
+        )
+        started_at = datetime.now(ALMATY_TZ)
+ 
+        try:
+            for batch_since, batch_until in batches:
+                raw, staging, _ = (
+                    run_pipeline_for_period(
+                        customer_id=customer_id,
+                        date_since=batch_since,
+                        date_until=batch_until,
+                        run_id=run_id,
+                        run_type=run_type,
+                    )
+                )
+                total_raw += raw
+                total_staging += staging
+ 
             run_embeddings_after_pipeline(
                 customer_id=customer_id,
             )
-
-        print("Google Ads daily run finished")
+ 
+            # Считаем фактические строки в core
+            total_core = core_loader.count_core_rows(
+                date_since=date_since,
+                date_until=date_until,
+            )
+ 
+            etl_logger.finish_run(
+                run_id=run_id,
+                started_at=started_at,
+                status="success",
+                total_raw_rows=total_raw,
+                total_staging_rows=total_staging,
+                total_core_rows=total_core,
+                actual_min_date=date_since,
+                actual_max_date=date_until,
+            )
+ 
+        except Exception as e:
+            import traceback
+            etl_logger.finish_run(
+                run_id=run_id,
+                started_at=started_at,
+                status="failed",
+                total_raw_rows=total_raw,
+                total_staging_rows=total_staging,
+                total_core_rows=total_core,
+                error_message=str(e),
+                error_trace=traceback.format_exc(),
+            )
+            raise
+ 
+    print(f"Google Ads {run_type} finished")
 
 
 if __name__ == "__main__":

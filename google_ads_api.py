@@ -1,3 +1,23 @@
+"""
+google_ads_api.py
+
+Выгрузка данных из Google Ads API и формирование строк для ClickHouse:
+- fetch_campaign_goals()              — цели кампаний (campaign_goal.goal_type)
+- fetch_campaign_budget_info_*()      — бюджеты и биддинг
+- fetch_ad_hourly_data()              — метрики по часам на уровне кампании
+- fetch_ad_group_ad_daily_data()      — метрики по дням на уровне объявления
+- fetch_geo_daily_data()              — гео-метрики по дням
+- fetch_daily_campaign_data()         — метрики по дням на уровне кампании
+- fetch_daily_search_term_data()      — поисковые запросы по дням
+- fetch_gender_daily_data()           — метрики по полу по дням
+- fetch_creative_assets_data()        — креативы и ассеты
+
+Цель кампании определяется по campaign_goal.goal_type (приоритет:
+SALES > LEADS > APP_PROMOTION > WEBSITE_TRAFFIC > BRAND_AWARENESS >
+LOCAL_STORE_VISITS). При отсутствии цели — fallback по
+advertising_channel_type.
+"""
+
 import json
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -13,48 +33,50 @@ import queries
 
 
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
-_SUFFIX = "_staging"
-_HOURLY = "_hourly_campaign_level"
 
-SALES_HOURLY_TABLE = (
-    "google_ads_sales_hourly_campaign_level_staging"
-)
-LEADS_HOURLY_TABLE = (
-    "google_ads_leads_hourly_campaign_level_staging"
-)
-WEBSITE_TRAFFIC_HOURLY_TABLE = (
-    "google_ads_website_traffic_hourly_campaign_level_staging"
-)
-APP_PROMOTION_HOURLY_TABLE = (
-    "google_ads_app_promotion_hourly_campaign_level_staging"
-)
-YOUTUBE_REACH_VIEWS_ENGAGEMENT_HOURLY_TABLE = (
-    "google_ads_youtube_reach_views_engagement"
-    "_hourly_campaign_level_staging"
-)
-STORE_VISITS_PROMOTIONS_HOURLY_TABLE = (
-    "google_ads_store_visits_promotions_hourly_campaign_level_staging"
-)
-NO_GOAL_HOURLY_TABLE = (
-    "google_ads_no_goal_hourly_campaign_level_staging"
-)
-
-
-GOAL_PRIORITY = {
-    NO_GOAL_HOURLY_TABLE: 0,
-    WEBSITE_TRAFFIC_HOURLY_TABLE: 10,
-    STORE_VISITS_PROMOTIONS_HOURLY_TABLE: 20,
-    APP_PROMOTION_HOURLY_TABLE: 30,
-    LEADS_HOURLY_TABLE: 40,
-    SALES_HOURLY_TABLE: 50,
-    YOUTUBE_REACH_VIEWS_ENGAGEMENT_HOURLY_TABLE: 60,
+# campaign_goal.goal_type → table prefix
+_GOAL_TYPE_TO_PREFIX: dict[str, str] = {
+    "SALES": "google_ads_sales",
+    "LEADS": "google_ads_leads",
+    "WEBSITE_TRAFFIC": "google_ads_website_traffic",
+    "APP_PROMOTION": "google_ads_app_promotion",
+    "BRAND_AWARENESS_AND_CONSIDERATION": (
+        "google_ads_youtube_reach_views_engagement"
+    ),
+    "LOCAL_STORE_VISITS_AND_PROMOTIONS": (
+        "google_ads_store_visits_promotions"
+    ),
 }
 
+# Priority when a campaign has multiple goals (e.g. PMax)
+_GOAL_PRIORITY: list[str] = [
+    "SALES",
+    "LEADS",
+    "APP_PROMOTION",
+    "WEBSITE_TRAFFIC",
+    "BRAND_AWARENESS_AND_CONSIDERATION",
+    "LOCAL_STORE_VISITS_AND_PROMOTIONS",
+]
 
-_CAMPAIGN_GOAL_HINTS_CACHE: dict[
-    tuple[str, str, str],
-    dict[str, dict[str, Any]],
-] = {}
+# Fallback when no campaign_goal exists: advertising_channel_type → prefix
+_CHANNEL_TYPE_TO_PREFIX: dict[str, str] = {
+    "VIDEO": "google_ads_youtube_reach_views_engagement",
+    "MULTI_CHANNEL": "google_ads_app_promotion",
+    "SHOPPING": "google_ads_sales",
+    "SMART": "google_ads_store_visits_promotions",
+    "LOCAL": "google_ads_store_visits_promotions",
+    "SEARCH": "google_ads_website_traffic",
+    "DISPLAY": "google_ads_website_traffic",
+    "PERFORMANCE_MAX": "google_ads_website_traffic",
+    "DEMAND_GEN": "google_ads_website_traffic",
+    "DISCOVERY": "google_ads_website_traffic",
+}
+
+# campaign_id -> [goal_type, ...] — fetched once per customer per run
+_CAMPAIGN_GOALS_CACHE: dict[str, dict[str, list[str]]] = {}
+
+# campaign_id -> budget info — fetched once per customer per run
+_CAMPAIGN_BUDGET_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def get_client() -> GoogleAdsClient:
@@ -254,242 +276,54 @@ def row_has_field(row: Any, path: str) -> bool:
     return True
 
 
-def get_row_text_for_goal_detection(row: Any) -> str:
-    parts = [
-        enum_name(row.campaign.advertising_channel_type) or "",
-        enum_name(row.campaign.advertising_channel_sub_type) or "",
-        enum_name(row.campaign.bidding_strategy_type) or "",
-        str(row.campaign.name or ""),
-    ]
-
-    if row_has_field(row, "segments.ad_network_type"):
-        parts.append(enum_name(row.segments.ad_network_type) or "")
-
-    if row_has_field(row, "ad_group_ad.ad.type"):
-        parts.append(enum_name(row.ad_group_ad.ad.type) or "")
-
-    return " ".join(parts).lower()
-
-
-def has_youtube_or_video_signal(row: Any) -> bool:
-    text = get_row_text_for_goal_detection(row)
-
-    youtube_words = (
-        "youtube",
-        "video",
-        "видео",
-        "просмотр",
-        "просмотры",
-        "охват",
-        "engagement",
-        "взаимодейств",
-        "video_responsive_ad",
-        "youtube_watch",
-        "youtube_search",
-    )
-
-    if any(word in text for word in youtube_words):
-        return True
-
-    if row_has_field(row, "metrics.video_trueview_views"):
-        if safe_int(row.metrics.video_trueview_views) > 0:
-            return True
-
-    if row_has_field(row, "metrics.video_trueview_view_rate"):
-        if safe_float(row.metrics.video_trueview_view_rate) > 0:
-            return True
-
-    if row_has_field(row, "metrics.video_quartile_p25_rate"):
-        if safe_float(row.metrics.video_quartile_p25_rate) > 0:
-            return True
-
-    if row_has_field(row, "metrics.video_quartile_p50_rate"):
-        if safe_float(row.metrics.video_quartile_p50_rate) > 0:
-            return True
-
-    if row_has_field(row, "metrics.video_quartile_p75_rate"):
-        if safe_float(row.metrics.video_quartile_p75_rate) > 0:
-            return True
-
-    if row_has_field(row, "metrics.video_quartile_p100_rate"):
-        if safe_float(row.metrics.video_quartile_p100_rate) > 0:
-            return True
-
-    if row_has_field(row, "metrics.coviewed_impressions"):
-        if safe_int(row.metrics.coviewed_impressions) > 0:
-            return True
-
-    if row_has_field(row, "metrics.primary_impressions"):
-        if safe_int(row.metrics.primary_impressions) > 0:
-            return True
-
-    if row_has_field(row, "metrics.unique_users"):
-        reach = safe_int(row.metrics.unique_users)
-        frequency = (
-            safe_float(row.metrics.average_impression_frequency_per_user)
-            if row_has_field(
-                row,
-                "metrics.average_impression_frequency_per_user",
-            )
-            else 0.0
-        )
-
-        if reach > 0 and frequency > 0:
-            return True
-
-    return False
-
-
-def detect_target_table_from_row(row: Any) -> str:
-    channel_type = enum_name(row.campaign.advertising_channel_type) or ""
-
-    text = get_row_text_for_goal_detection(row)
-
-    # 1. YouTube / video / reach / engagement.
-    # Ставим первым, потому что часть YouTube-кампаний может приходить как DISPLAY + UNSPECIFIED.
-    if has_youtube_or_video_signal(row):
-        return YOUTUBE_REACH_VIEWS_ENGAGEMENT_HOURLY_TABLE
-
-    # 2. App promotion.
-    if "app" in text or "прилож" in text:
-        return APP_PROMOTION_HOURLY_TABLE
-
-    # 3. Leads.
-    if (
-        "lead" in text
-        or "лид" in text
-        or "заявк" in text
-        or "форма" in text
-    ):
-        return LEADS_HOURLY_TABLE
-
-    # 4. Sales.
-    if (
-        "sale" in text
-        or "sales" in text
-        or "продаж" in text
-        or "purchase" in text
-        or "покуп" in text
-        or "shop" in text
-    ):
-        return SALES_HOURLY_TABLE
-
-    # 5. Website traffic.
-    if (
-        "traffic" in text
-        or "трафик" in text
-        or "site" in text
-        or "website" in text
-        or "сайт" in text
-        or channel_type == "SEARCH"
-    ):
-        return WEBSITE_TRAFFIC_HOURLY_TABLE
-
-    # 6. Store visits / promotions.
-    if (
-        "store" in text
-        or "магазин" in text
-        or "visit" in text
-        or "promotion" in text
-        or "promo" in text
-        or "промо" in text
-    ):
-        return STORE_VISITS_PROMOTIONS_HOURLY_TABLE
-
-    # 7. Display без video/reach/engagement-сигналов считаем display traffic.
-    if channel_type == "DISPLAY":
-        return WEBSITE_TRAFFIC_HOURLY_TABLE
-
-    return NO_GOAL_HOURLY_TABLE
-
-
-def get_target_table(
-    row: Any,
-    *,
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
+def _get_goal_prefix(
+    campaign_id: str,
+    goals_map: dict[str, list[str]],
+    channel_type: str,
 ) -> str:
-    campaign_id = str(row.campaign.id)
-
-    if campaign_goal_hints_by_campaign:
-        hint = campaign_goal_hints_by_campaign.get(campaign_id)
-
-        if hint and hint.get("table_name"):
-            return str(hint["table_name"])
-
-    return detect_target_table_from_row(row)
-
-
-def get_daily_target_table(
-    row,
-    *,
-    campaign_goal_hints_by_campaign=None,
-):
-    hourly_table = get_target_table(
-        row,
-        campaign_goal_hints_by_campaign=(
-            campaign_goal_hints_by_campaign
-        ),
-    )
-    return hourly_table.replace(
-        "_hourly_campaign_level_staging",
-        "_daily_ad_level_staging",
+    goals = goals_map.get(campaign_id, [])
+    for goal in _GOAL_PRIORITY:
+        if goal in goals:
+            return _GOAL_TYPE_TO_PREFIX[goal]
+    return _CHANNEL_TYPE_TO_PREFIX.get(
+        channel_type, "google_ads_no_goal"
     )
 
 
-def get_daily_geo_target_table(
-    row,
-    *,
-    campaign_goal_hints_by_campaign=None,
-):
-    hourly_table = get_target_table(
-        row,
-        campaign_goal_hints_by_campaign=(
-            campaign_goal_hints_by_campaign
-        ),
-    )
-    return hourly_table.replace(
-        "_hourly_campaign_level_staging",
-        "_geo_daily_region_level_staging",
-    )
+def get_hourly_table(
+    campaign_id: str,
+    goals_map: dict[str, list[str]],
+    channel_type: str,
+) -> str:
+    prefix = _get_goal_prefix(campaign_id, goals_map, channel_type)
+    return f"{prefix}_hourly_campaign_level_staging"
 
 
-def get_daily_campaign_target_table(
-    row,
-    *,
-    campaign_goal_hints_by_campaign=None,
-):
-    hourly_table = get_target_table(
-        row,
-        campaign_goal_hints_by_campaign=(
-            campaign_goal_hints_by_campaign
-        ),
-    )
-    return hourly_table.replace(
-        "_hourly_campaign_level_staging",
-        "_daily_campaign_level_staging",
-    )
+def get_daily_ad_table(
+    campaign_id: str,
+    goals_map: dict[str, list[str]],
+    channel_type: str,
+) -> str:
+    prefix = _get_goal_prefix(campaign_id, goals_map, channel_type)
+    return f"{prefix}_daily_ad_level_staging"
 
 
-def get_google_ads_goal_type(table_name: str) -> str:
-    _h = _HOURLY + _SUFFIX
-    mapping = {
-        "google_ads_sales" + _h: "sales",
-        "google_ads_leads" + _h: "leads",
-        "google_ads_website_traffic" + _h: "website_traffic",
-        "google_ads_app_promotion" + _h: "app_promotion",
-        "google_ads_youtube_reach_views_engagement"
-        + _h: "youtube_reach_views_engagement",
-        "google_ads_store_visits_promotions"
-        + _h: "store_visits_promotions",
-        "google_ads_no_goal" + _h: "no_goal",
-    }
-    hourly_table_name = (
-        table_name
-        .replace("_geo_daily_region_level" + _SUFFIX, _h)
-        .replace("_daily_campaign_level" + _SUFFIX, _h)
-        .replace("_daily_ad_level" + _SUFFIX, _h)
-    )
-    return mapping.get(hourly_table_name, "no_goal")
+def get_daily_campaign_table(
+    campaign_id: str,
+    goals_map: dict[str, list[str]],
+    channel_type: str,
+) -> str:
+    prefix = _get_goal_prefix(campaign_id, goals_map, channel_type)
+    return f"{prefix}_daily_campaign_level_staging"
+
+
+def get_goal_type_str(
+    campaign_id: str,
+    goals_map: dict[str, list[str]],
+    channel_type: str,
+) -> str:
+    prefix = _get_goal_prefix(campaign_id, goals_map, channel_type)
+    return prefix.removeprefix("google_ads_")
 
 
 def row_to_raw_dict(row: Any) -> dict[str, Any]:
@@ -654,10 +488,50 @@ def fetch_targeted_locations_by_campaign(
     return result
 
 
+def fetch_campaign_goals(
+    *,
+    customer_id: str,
+) -> dict[str, list[str]]:
+    if customer_id in _CAMPAIGN_GOALS_CACHE:
+        return _CAMPAIGN_GOALS_CACHE[customer_id]
+
+    client = get_client()
+    google_ads_service = client.get_service("GoogleAdsService")
+    result: dict[str, list[str]] = {}
+
+    try:
+        response = google_ads_service.search(
+            customer_id=customer_id,
+            query=queries.CAMPAIGN_GOALS_QUERY,
+        )
+        for row in response:
+            campaign_id = str(row.campaign.id)
+            goal_type = enum_name(row.campaign_goal.goal_type)
+            if goal_type and goal_type not in (
+                "UNSPECIFIED", "UNKNOWN", "None", ""
+            ):
+                result.setdefault(campaign_id, []).append(goal_type)
+
+    except GoogleAdsException as ex:
+        print("Google Ads campaign goals fetch failed")
+        print(f"Request ID: {ex.request_id}")
+        print(f"Status: {ex.error.code().name}")
+        for error in ex.failure.errors:
+            print(f"Error: {error.message}")
+        _CAMPAIGN_GOALS_CACHE[customer_id] = {}
+        return {}
+
+    _CAMPAIGN_GOALS_CACHE[customer_id] = result
+    return result
+
+
 def fetch_campaign_budget_info_by_campaign(
     *,
     customer_id: str,
 ) -> dict[str, dict[str, Any]]:
+    if customer_id in _CAMPAIGN_BUDGET_CACHE:
+        return _CAMPAIGN_BUDGET_CACHE[customer_id]
+
     client = get_client()
     google_ads_service = client.get_service("GoogleAdsService")
 
@@ -702,9 +576,11 @@ def fetch_campaign_budget_info_by_campaign(
                 "campaign_primary_status_reasons_json": (
                     primary_status_reasons_json
                 ),
-                "budget_id": str(row.campaign_budget.id)
+                "budget_id": (
+                    str(row.campaign_budget.id)
                     if row.campaign_budget.id
-                    else None,
+                    else None
+                ),
                 "budget_name": row.campaign_budget.name or None,
                 "budget_period": budget_period,
                 "daily_budget": daily_budget,
@@ -726,102 +602,24 @@ def fetch_campaign_budget_info_by_campaign(
         for error in ex.failure.errors:
             print(f"Error: {error.message}")
 
+        _CAMPAIGN_BUDGET_CACHE[customer_id] = {}
         return {}
 
-    return result
-
-
-def fetch_campaign_goal_hints_by_campaign(
-    *,
-    customer_id: str,
-    date_since: str,
-    date_until: str,
-) -> dict[str, dict[str, Any]]:
-    """
-    Строит единый campaign_id -> goal mapping на уровне кампании.
-
-    Зачем:
-    geo_daily / ad / hourly / search_term строки не всегда содержат все сигналы цели.
-    Например кампания может быть DISPLAY + UNSPECIFIED, но по daily_campaign
-    иметь reach/frequency и относиться к reach/views/engagement.
-    """
-    cache_key = (customer_id, date_since, date_until)
-
-    if cache_key in _CAMPAIGN_GOAL_HINTS_CACHE:
-        return _CAMPAIGN_GOAL_HINTS_CACHE[cache_key]
-
-    client = get_client()
-    google_ads_service = client.get_service("GoogleAdsService")
-
-    query = queries.DAILY_CAMPAIGN_QUERY.format(
-        date_since=date_since,
-        date_until=date_until,
-    )
-
-    result: dict[str, dict[str, Any]] = {}
-
-    try:
-        stream = google_ads_service.search_stream(
-            customer_id=customer_id,
-            query=query,
-        )
-
-        for batch in stream:
-            for row in batch.results:
-                campaign_id = str(row.campaign.id)
-                table_name = detect_target_table_from_row(row)
-
-                old_hint = result.get(campaign_id)
-                old_priority = (
-                    GOAL_PRIORITY.get(str(old_hint["table_name"]), 0)
-                    if old_hint
-                    else -1
-                )
-                new_priority = GOAL_PRIORITY.get(table_name, 0)
-
-                if old_hint is None or new_priority >= old_priority:
-                    result[campaign_id] = {
-                        "campaign_id": campaign_id,
-                        "campaign_name": row.campaign.name,
-                        "table_name": table_name,
-                        "goal_type": get_google_ads_goal_type(table_name),
-                        "advertising_channel_type": enum_name(
-                            row.campaign.advertising_channel_type
-                        ),
-                        "advertising_channel_sub_type": enum_name(
-                            row.campaign.advertising_channel_sub_type
-                        ),
-                        "bidding_strategy_type": enum_name(
-                            row.campaign.bidding_strategy_type
-                        ),
-                    }
-
-    except GoogleAdsException as ex:
-        print("Google Ads campaign goal hints request failed")
-        print(f"Request ID: {ex.request_id}")
-        print(f"Status: {ex.error.code().name}")
-
-        for error in ex.failure.errors:
-            print(f"Error: {error.message}")
-
-        _CAMPAIGN_GOAL_HINTS_CACHE[cache_key] = {}
-        return {}
-
-    _CAMPAIGN_GOAL_HINTS_CACHE[cache_key] = result
-
+    _CAMPAIGN_BUDGET_CACHE[customer_id] = result
     return result
 
 
 def build_clickhouse_row(
     row: Any,
     *,
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
+    campaign_goals_map: dict[str, list[str]],
 ) -> tuple[str, list[Any]]:
     date_start, date_stop = get_hourly_datetime_range(row)
 
-    table_name = get_target_table(
-        row,
-        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
+    campaign_id = str(row.campaign.id)
+    channel_type = enum_name(row.campaign.advertising_channel_type) or ""
+    table_name = get_hourly_table(
+        campaign_id, campaign_goals_map, channel_type
     )
 
     # Micros -> money. Это не бизнес-расчет метрики,
@@ -888,15 +686,19 @@ def build_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_google_ads_goal_type(table_name),
+        "google_ads_goal_type": get_goal_type_str(
+            campaign_id, campaign_goals_map, channel_type
+        ),
 
         "device": enum_name(row.segments.device),
 
         "ad_network_type": enum_name(row.segments.ad_network_type),
 
-        "budget_id": str(row.campaign_budget.id)
+        "budget_id": (
+            str(row.campaign_budget.id)
             if row.campaign_budget.id
-            else None,
+            else None
+        ),
         "budget_name": row.campaign_budget.name or None,
         "budget_period": budget_period,
         "daily_budget": daily_budget,
@@ -1007,11 +809,11 @@ def build_clickhouse_row(
             row.metrics.active_view_audibility_measurable_impressions_rate
         ),
 
-        "active_view_audibility_invalid_measurable_impressions_rate": float(
-            row.metrics.active_view_audibility_invalid_measurable_impressions_rate
+        "active_view_audibility_invalid_measurable_impressions_rate": float(  # noqa: E501
+            row.metrics.active_view_audibility_invalid_measurable_impressions_rate  # noqa: E501
         ),
-        "active_view_audibility_invalid_givt_measurable_impressions_rate": float(
-            row.metrics.active_view_audibility_invalid_givt_measurable_impressions_rate
+        "active_view_audibility_invalid_givt_measurable_impressions_rate": float(  # noqa: E501
+            row.metrics.active_view_audibility_invalid_givt_measurable_impressions_rate  # noqa: E501
         ),
 
         "active_view_audible_impressions": int(
@@ -1107,13 +909,14 @@ def build_ad_group_ad_daily_clickhouse_row(
     row: Any,
     *,
     campaign_budget_info_by_campaign: dict[str, dict[str, Any]],
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
+    campaign_goals_map: dict[str, list[str]],
 ) -> tuple[str, list[Any]]:
     date_start, date_stop = get_daily_datetime_range(row)
 
-    table_name = get_daily_target_table(
-        row,
-        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
+    campaign_id = str(row.campaign.id)
+    channel_type = enum_name(row.campaign.advertising_channel_type) or ""
+    table_name = get_daily_ad_table(
+        campaign_id, campaign_goals_map, channel_type
     )
 
     # Micros -> money. Это не бизнес-расчет метрики,
@@ -1142,7 +945,8 @@ def build_ad_group_ad_daily_clickhouse_row(
 
     cost_converted_currency_per_platform_comparable_conversion = (
         micros_to_money(
-            row.metrics.cost_converted_currency_per_platform_comparable_conversion
+            row.metrics  # noqa: E501
+            .cost_converted_currency_per_platform_comparable_conversion
         )
     )
     cost_per_platform_comparable_conversion = micros_to_money(
@@ -1207,8 +1011,6 @@ def build_ad_group_ad_daily_clickhouse_row(
         row.metrics.all_lead_revenue_micros
     )
 
-    campaign_id = str(row.campaign.id)
-
     campaign_budget_info = campaign_budget_info_by_campaign.get(
         campaign_id,
         {},
@@ -1242,7 +1044,9 @@ def build_ad_group_ad_daily_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_google_ads_goal_type(table_name),
+        "google_ads_goal_type": get_goal_type_str(
+            campaign_id, campaign_goals_map, channel_type
+        ),
 
         "ad_group_id": str(row.ad_group.id),
         "ad_group_name": row.ad_group.name or None,
@@ -1350,11 +1154,11 @@ def build_ad_group_ad_daily_clickhouse_row(
             row.metrics.active_view_audibility_measurable_impressions_rate
         ),
 
-        "active_view_audibility_invalid_measurable_impressions_rate": float(
-            row.metrics.active_view_audibility_invalid_measurable_impressions_rate
+        "active_view_audibility_invalid_measurable_impressions_rate": float(  # noqa: E501
+            row.metrics.active_view_audibility_invalid_measurable_impressions_rate  # noqa: E501
         ),
-        "active_view_audibility_invalid_givt_measurable_impressions_rate": float(
-            row.metrics.active_view_audibility_invalid_givt_measurable_impressions_rate
+        "active_view_audibility_invalid_givt_measurable_impressions_rate": float(  # noqa: E501
+            row.metrics.active_view_audibility_invalid_givt_measurable_impressions_rate  # noqa: E501
         ),
 
         "active_view_audible_impressions": int(
@@ -1462,14 +1266,15 @@ def build_ad_group_ad_daily_clickhouse_row(
         "platform_comparable_conversions_from_interactions_rate": float(
             row.metrics.platform_comparable_conversions_from_interactions_rate
         ),
-        "platform_comparable_conversions_from_interactions_value_per_interaction": float(
-            row.metrics.platform_comparable_conversions_from_interactions_value_per_interaction
+        "platform_comparable_conversions_from_interactions_value_per_interaction": float(  # noqa: E501
+            row.metrics.platform_comparable_conversions_from_interactions_value_per_interaction  # noqa: E501
         ),
         "platform_comparable_conversions_value": float(
             row.metrics.platform_comparable_conversions_value
         ),
         "platform_comparable_conversions_value_by_conversion_date": float(
-            row.metrics.platform_comparable_conversions_value_by_conversion_date
+            row.metrics  # noqa: E501
+            .platform_comparable_conversions_value_by_conversion_date
         ),
         "platform_comparable_conversions_value_per_cost": float(
             row.metrics.platform_comparable_conversions_value_per_cost
@@ -1485,7 +1290,8 @@ def build_ad_group_ad_daily_clickhouse_row(
             row.metrics.value_per_platform_comparable_conversion
         ),
         "value_per_platform_comparable_conversions_by_conversion_date": float(
-            row.metrics.value_per_platform_comparable_conversions_by_conversion_date
+            row.metrics  # noqa: E501
+            .value_per_platform_comparable_conversions_by_conversion_date
         ),
 
         "orders": float(row.metrics.orders),
@@ -1559,14 +1365,14 @@ def build_geo_daily_clickhouse_row(
     geo_constants_map: dict[str, dict[str, Any]],
     targeted_locations_by_campaign: dict[str, str],
     campaign_budget_info_by_campaign: dict[str, dict[str, Any]],
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
-) -> tuple[str, list[Any]]:
+    campaign_goals_map: dict[str, list[str]],
+) -> list[Any]:
     date_start, date_stop = get_daily_datetime_range(row)
 
-    table_name = get_daily_geo_target_table(
-        row,
-        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
-    )
+    # Geo данные не разбиваются по целям — одна таблица.
+    # goal_type всё равно записываем в строку как атрибут.
+    campaign_id = str(row.campaign.id)
+    channel_type = enum_name(row.campaign.advertising_channel_type) or ""
 
     # Micros -> money. Это не бизнес-расчет метрики,
     # а техническая конвертация из micros в нормальную валюту.
@@ -1580,8 +1386,6 @@ def build_geo_daily_clickhouse_row(
     cost_per_all_conversions = micros_to_money(
         row.metrics.cost_per_all_conversions
     )
-
-    campaign_id = str(row.campaign.id)
 
     campaign_budget_info = campaign_budget_info_by_campaign.get(
         campaign_id,
@@ -1625,7 +1429,9 @@ def build_geo_daily_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_google_ads_goal_type(table_name),
+        "google_ads_goal_type": get_goal_type_str(
+            campaign_id, campaign_goals_map, channel_type
+        ),
 
         "geo_location_name": (
             city_info.get("name")
@@ -1739,7 +1545,7 @@ def build_geo_daily_clickhouse_row(
         "loaded_at": datetime.now(ALMATY_TZ),
     }
 
-    return table_name, [
+    return [
         row_data[column]
         for column in clickhouse_db.DAILY_GEO_TABLE_COLUMNS
     ]
@@ -1748,13 +1554,14 @@ def build_geo_daily_clickhouse_row(
 def build_daily_campaign_clickhouse_row(
     row: Any,
     *,
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
+    campaign_goals_map: dict[str, list[str]],
 ) -> tuple[str, list[Any]]:
     date_start, date_stop = get_daily_datetime_range(row)
 
-    table_name = get_daily_campaign_target_table(
-        row,
-        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
+    campaign_id = str(row.campaign.id)
+    channel_type = enum_name(row.campaign.advertising_channel_type) or ""
+    table_name = get_daily_campaign_table(
+        campaign_id, campaign_goals_map, channel_type
     )
 
     # Micros -> money. Это не бизнес-расчет метрики,
@@ -1787,7 +1594,8 @@ def build_daily_campaign_clickhouse_row(
 
     cost_converted_currency_per_platform_comparable_conversion = (
         micros_to_money(
-            row.metrics.cost_converted_currency_per_platform_comparable_conversion
+            row.metrics  # noqa: E501
+            .cost_converted_currency_per_platform_comparable_conversion
         )
     )
     cost_per_platform_comparable_conversion = micros_to_money(
@@ -1887,22 +1695,24 @@ def build_daily_campaign_clickhouse_row(
         "customer_id": str(row.customer.id),
         "customer_name": row.customer.descriptive_name,
 
-        "campaign_id": str(row.campaign.id),
+        "campaign_id": campaign_id,
         "campaign_name": row.campaign.name,
         "campaign_status": enum_name(row.campaign.status),
         "campaign_primary_status": enum_name(row.campaign.primary_status),
         "campaign_primary_status_reasons_json": primary_status_reasons_json,
-        "advertising_channel_type": enum_name(
-            row.campaign.advertising_channel_type
-        ),
+        "advertising_channel_type": channel_type,
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_google_ads_goal_type(table_name),
+        "google_ads_goal_type": get_goal_type_str(
+            campaign_id, campaign_goals_map, channel_type
+        ),
 
-        "budget_id": str(row.campaign_budget.id)
+        "budget_id": (
+            str(row.campaign_budget.id)
             if row.campaign_budget.id
-            else None,
+            else None
+        ),
         "budget_name": row.campaign_budget.name or None,
         "budget_period": budget_period,
         "daily_budget": daily_budget,
@@ -2042,11 +1852,11 @@ def build_daily_campaign_clickhouse_row(
         "active_view_audibility_measurable_impressions_rate": float(
             row.metrics.active_view_audibility_measurable_impressions_rate
         ),
-        "active_view_audibility_invalid_measurable_impressions_rate": float(
-            row.metrics.active_view_audibility_invalid_measurable_impressions_rate
+        "active_view_audibility_invalid_measurable_impressions_rate": float(  # noqa: E501
+            row.metrics.active_view_audibility_invalid_measurable_impressions_rate  # noqa: E501
         ),
-        "active_view_audibility_invalid_givt_measurable_impressions_rate": float(
-            row.metrics.active_view_audibility_invalid_givt_measurable_impressions_rate
+        "active_view_audibility_invalid_givt_measurable_impressions_rate": float(  # noqa: E501
+            row.metrics.active_view_audibility_invalid_givt_measurable_impressions_rate  # noqa: E501
         ),
         "active_view_audible_impressions": int(
             row.metrics.active_view_audible_impressions
@@ -2143,10 +1953,11 @@ def build_daily_campaign_clickhouse_row(
             row.metrics.current_model_attributed_conversions_value
         ),
         "current_model_attributed_conversions_from_interactions_rate": float(
-            row.metrics.current_model_attributed_conversions_from_interactions_rate
+            row.metrics  # noqa: E501
+            .current_model_attributed_conversions_from_interactions_rate
         ),
-        "current_model_attributed_conversions_from_interactions_value_per_interaction": float(
-            row.metrics.current_model_attributed_conversions_from_interactions_value_per_interaction
+        "current_model_attributed_conversions_from_interactions_value_per_interaction": float(  # noqa: E501
+            row.metrics.current_model_attributed_conversions_from_interactions_value_per_interaction  # noqa: E501
         ),
         "current_model_attributed_conversions_value_per_cost": float(
             row.metrics.current_model_attributed_conversions_value_per_cost
@@ -2167,14 +1978,15 @@ def build_daily_campaign_clickhouse_row(
         "platform_comparable_conversions_from_interactions_rate": float(
             row.metrics.platform_comparable_conversions_from_interactions_rate
         ),
-        "platform_comparable_conversions_from_interactions_value_per_interaction": float(
-            row.metrics.platform_comparable_conversions_from_interactions_value_per_interaction
+        "platform_comparable_conversions_from_interactions_value_per_interaction": float(  # noqa: E501
+            row.metrics.platform_comparable_conversions_from_interactions_value_per_interaction  # noqa: E501
         ),
         "platform_comparable_conversions_value": float(
             row.metrics.platform_comparable_conversions_value
         ),
         "platform_comparable_conversions_value_by_conversion_date": float(
-            row.metrics.platform_comparable_conversions_value_by_conversion_date
+            row.metrics  # noqa: E501
+            .platform_comparable_conversions_value_by_conversion_date
         ),
         "platform_comparable_conversions_value_per_cost": float(
             row.metrics.platform_comparable_conversions_value_per_cost
@@ -2189,7 +2001,8 @@ def build_daily_campaign_clickhouse_row(
             row.metrics.value_per_platform_comparable_conversion
         ),
         "value_per_platform_comparable_conversions_by_conversion_date": float(
-            row.metrics.value_per_platform_comparable_conversions_by_conversion_date
+            row.metrics  # noqa: E501
+            .value_per_platform_comparable_conversions_by_conversion_date
         ),
 
         "orders": float(row.metrics.orders),
@@ -2357,7 +2170,8 @@ def build_daily_campaign_clickhouse_row(
         ),
 
         "view_through_conversions_from_location_asset_click_to_call": float(
-            row.metrics.view_through_conversions_from_location_asset_click_to_call
+            row.metrics  # noqa: E501
+            .view_through_conversions_from_location_asset_click_to_call
         ),
         "view_through_conversions_from_location_asset_directions": float(
             row.metrics.view_through_conversions_from_location_asset_directions
@@ -2369,10 +2183,12 @@ def build_daily_campaign_clickhouse_row(
             row.metrics.view_through_conversions_from_location_asset_order
         ),
         "view_through_conversions_from_location_asset_other_engagement": float(
-            row.metrics.view_through_conversions_from_location_asset_other_engagement
+            row.metrics  # noqa: E501
+            .view_through_conversions_from_location_asset_other_engagement
         ),
         "view_through_conversions_from_location_asset_store_visits": float(
-            row.metrics.view_through_conversions_from_location_asset_store_visits
+            row.metrics  # noqa: E501
+            .view_through_conversions_from_location_asset_store_visits
         ),
         "view_through_conversions_from_location_asset_website": float(
             row.metrics.view_through_conversions_from_location_asset_website
@@ -2391,11 +2207,12 @@ def build_daily_search_term_clickhouse_row(
     row: Any,
     *,
     campaign_budget_info_by_campaign: dict[str, dict[str, Any]],
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
+    campaign_goals_map: dict[str, list[str]],
 ) -> list[Any]:
     date_start, date_stop = get_daily_datetime_range(row)
 
     campaign_id = str(row.campaign.id)
+    channel_type = enum_name(row.campaign.advertising_channel_type) or ""
 
     campaign_budget_info = campaign_budget_info_by_campaign.get(
         campaign_id,
@@ -2440,11 +2257,8 @@ def build_daily_search_term_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_google_ads_goal_type(
-            get_target_table(
-                row,
-                campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
-            )
+        "google_ads_goal_type": get_goal_type_str(
+            campaign_id, campaign_goals_map, channel_type
         ),
 
         "ad_group_id": str(row.ad_group.id),
@@ -2698,7 +2512,8 @@ def build_direct_image_ad_clickhouse_row(row: Any) -> list[Any]:
         "asset_group_strength": None,
         "asset_group_asset_status": None,
 
-        # У IMAGE_AD нет отдельного asset.id, поэтому делаем стабильный технический asset_id.
+        # У IMAGE_AD нет отдельного asset.id —
+        # используем стабильный технический id.
         "asset_id": f"direct_image_ad_{ad_id}" if ad_id else None,
         "asset_name": (
             row.ad_group_ad.ad.name
@@ -2874,14 +2689,12 @@ def build_asset_group_asset_clickhouse_row(row: Any) -> list[Any]:
 def build_gender_daily_clickhouse_row(
     row: Any,
     *,
-    campaign_goal_hints_by_campaign: dict[str, dict[str, Any]] | None = None,
+    campaign_goals_map: dict[str, list[str]],
 ) -> list[Any]:
     date_start, date_stop = get_daily_datetime_range(row)
 
-    hourly_table = get_target_table(
-        row,
-        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
-    )
+    campaign_id = str(row.campaign.id)
+    channel_type = enum_name(row.campaign.advertising_channel_type) or ""
 
     spend = micros_to_money(row.metrics.cost_micros)
     average_cpc = micros_to_money(row.metrics.average_cpc)
@@ -2899,17 +2712,17 @@ def build_gender_daily_clickhouse_row(
         "customer_id": str(row.customer.id),
         "customer_name": row.customer.descriptive_name,
 
-        "campaign_id": str(row.campaign.id),
+        "campaign_id": campaign_id,
         "campaign_name": row.campaign.name,
         "campaign_status": enum_name(row.campaign.status),
         "campaign_primary_status": enum_name(row.campaign.primary_status),
-        "advertising_channel_type": enum_name(
-            row.campaign.advertising_channel_type
-        ),
+        "advertising_channel_type": channel_type,
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_google_ads_goal_type(hourly_table),
+        "google_ads_goal_type": get_goal_type_str(
+            campaign_id, campaign_goals_map, channel_type
+        ),
 
         "ad_group_id": str(row.ad_group.id) if row.ad_group.id else None,
         "ad_group_name": row.ad_group.name or None,
@@ -2991,11 +2804,7 @@ def fetch_ad_hourly_data(
 
     raw_rows: list[dict[str, Any]] = []
 
-    campaign_goal_hints_by_campaign = fetch_campaign_goal_hints_by_campaign(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
+    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -3009,7 +2818,7 @@ def fetch_ad_hourly_data(
 
                 table_name, formatted_row = build_clickhouse_row(
                     row,
-                    campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
+                    campaign_goals_map=campaign_goals_map,
                 )
                 grouped_rows[table_name].append(formatted_row)
 
@@ -3062,12 +2871,7 @@ def fetch_ad_group_ad_daily_data(
         )
     )
 
-    campaign_goal_hints_by_campaign = fetch_campaign_goal_hints_by_campaign(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
-
+    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -3085,7 +2889,7 @@ def fetch_ad_group_ad_daily_data(
                         campaign_budget_info_by_campaign=(
                             campaign_budget_info_by_campaign
                         ),
-                        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
+                        campaign_goals_map=campaign_goals_map,
                     )
                 )
 
@@ -3188,23 +2992,17 @@ def fetch_geo_daily_data(
         )
     )
 
-    campaign_goal_hints_by_campaign = fetch_campaign_goal_hints_by_campaign(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
+    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     for row in raw_proto_rows:
-        table_name, formatted_row = build_geo_daily_clickhouse_row(
+        formatted_row = build_geo_daily_clickhouse_row(
             row,
             geo_constants_map=geo_constants_map,
             targeted_locations_by_campaign=targeted_locations_by_campaign,
             campaign_budget_info_by_campaign=(
                 campaign_budget_info_by_campaign
             ),
-            campaign_goal_hints_by_campaign=(
-                campaign_goal_hints_by_campaign
-            ),
+            campaign_goals_map=campaign_goals_map,
         )
         rows.append(formatted_row)
 
@@ -3247,11 +3045,7 @@ def fetch_daily_campaign_data(
     }
 
     raw_rows: list[dict[str, Any]] = []
-    campaign_goal_hints_by_campaign = fetch_campaign_goal_hints_by_campaign(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
+    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -3266,7 +3060,7 @@ def fetch_daily_campaign_data(
                 table_name, formatted_row = (
                     build_daily_campaign_clickhouse_row(
                         row,
-                        campaign_goal_hints_by_campaign=campaign_goal_hints_by_campaign,
+                        campaign_goals_map=campaign_goals_map,
                     )
                 )
 
@@ -3317,11 +3111,7 @@ def fetch_daily_search_term_data(
         )
     )
 
-    campaign_goal_hints_by_campaign = fetch_campaign_goal_hints_by_campaign(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
+    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -3339,9 +3129,7 @@ def fetch_daily_search_term_data(
                         campaign_budget_info_by_campaign=(
                             campaign_budget_info_by_campaign
                         ),
-                        campaign_goal_hints_by_campaign=(
-                            campaign_goal_hints_by_campaign
-                        ),
+                        campaign_goals_map=campaign_goals_map,
                     )
                 )
 
@@ -3427,7 +3215,7 @@ def fetch_creative_assets_data(
             raise
 
     # Direct VIDEO_RESPONSIVE_AD отдельно:
-    # сначала собираем video asset ids, 
+    # сначала собираем video asset ids,
     # потом одним/несколькими запросами получаем YouTube metadata.
     direct_video_rows: list[Any] = []
     direct_video_asset_ids: set[str] = set()
@@ -3456,7 +3244,10 @@ def fetch_creative_assets_data(
                         direct_video_asset_ids.add(str(asset_id))
 
     except GoogleAdsException as ex:
-        print("Google Ads creative assets request failed: direct_video_responsive_ads")
+        print(
+            "Google Ads creative assets request failed: "
+            "direct_video_responsive_ads"
+        )
         print(f"Request ID: {ex.request_id}")
         print(f"Status: {ex.error.code().name}")
 
@@ -3514,11 +3305,7 @@ def fetch_gender_daily_data(
     raw_rows: list[dict[str, Any]] = []
     rows: list[list] = []
 
-    campaign_goal_hints_by_campaign = fetch_campaign_goal_hints_by_campaign(
-        customer_id=customer_id,
-        date_since=date_since,
-        date_until=date_until,
-    )
+    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -3533,9 +3320,7 @@ def fetch_gender_daily_data(
                 rows.append(
                     build_gender_daily_clickhouse_row(
                         row,
-                        campaign_goal_hints_by_campaign=(
-                            campaign_goal_hints_by_campaign
-                        ),
+                        campaign_goals_map=campaign_goals_map,
                     )
                 )
 
@@ -3556,9 +3341,7 @@ def fetch_gender_daily_data(
     response_data = {
         "rows_count": len(raw_rows),
         "data": raw_rows,
-        "campaign_goal_hints_campaigns_count": len(
-            campaign_goal_hints_by_campaign
-        ),
+        "campaign_goals_campaigns_count": len(campaign_goals_map),
     }
 
     return response_data, rows

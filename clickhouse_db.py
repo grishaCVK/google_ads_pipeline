@@ -1,3 +1,14 @@
+"""
+clickhouse_db.py
+
+Клиент и операции с ClickHouse:
+- get_client()        — подключение к google_ads_staging
+- get_raw_client()    — подключение к google_ads_raw
+- insert_raw_data()   — сохранение сырых API-ответов в raw_data
+- insert_*_rows()     — вставка строк в staging-таблицы
+- delete_*_for_period() — очистка staging за период перед вставкой
+"""
+
 import json
 import uuid
 from datetime import datetime, timedelta
@@ -53,9 +64,6 @@ DAILY_SEARCH_TERM_TABLE = "google_ads_daily_search_term_level_staging"
 CREATIVE_ASSET_TABLE = "google_ads_creative_assets_staging"
 
 GENDER_DAILY_TABLE = "google_ads_gender_daily_level_staging"
-
-# Старые имена оставляем для совместимости
-GOAL_TABLES = HOURLY_TABLES
 
 # ============================================================
 # Маппинг: staging_table_name -> hourly таблица (для insert func)
@@ -639,7 +647,7 @@ DAILY_CAMPAIGN_TABLE_COLUMNS = [
     "current_model_attributed_conversions",
     "current_model_attributed_conversions_value",
     "current_model_attributed_conversions_from_interactions_rate",
-    "current_model_attributed_conversions_from_interactions_value_per_interaction",
+    "current_model_attributed_conversions_from_interactions_value_per_interaction",  # noqa: E501
     "current_model_attributed_conversions_value_per_cost",
     "cost_per_current_model_attributed_conversion",
     "value_per_current_model_attributed_conversion",

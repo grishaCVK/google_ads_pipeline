@@ -12,7 +12,6 @@ from PIL import Image
 from sentence_transformers import SentenceTransformer
 
 import clickhouse_db
-import config
 
 
 EMBEDDING_MODEL_NAME = os.getenv(
@@ -25,7 +24,10 @@ POSTGRES_HOST = os.getenv(
     os.getenv("POSTGRES_HOST", "host.docker.internal"),
 )
 POSTGRES_PORT = int(
-    os.getenv("GOOGLE_EMBEDDINGS_POSTGRES_PORT", os.getenv("POSTGRES_PORT", "5432"))
+    os.getenv(
+        "GOOGLE_EMBEDDINGS_POSTGRES_PORT",
+        os.getenv("POSTGRES_PORT", "5432"),
+    )
 )
 POSTGRES_DB = os.getenv("GOOGLE_EMBEDDINGS_DB", "google_ads_embeddings")
 POSTGRES_USER = os.getenv(
@@ -70,7 +72,8 @@ def download_youtube_video(youtube_url: str, output_dir: str) -> str:
 
     ydl_opts = {
         # Берем H.264/AVC mp4, чтобы OpenCV нормально читал видео.
-        # AV1 часто вызывает ошибки декодирования внутри slim Docker-контейнера.
+        # AV1 часто вызывает ошибки декодирования
+        # внутри slim Docker-контейнера.
         "format": (
             "bestvideo[vcodec^=avc1][ext=mp4]/"
             "best[vcodec^=avc1][ext=mp4]/"
@@ -87,7 +90,9 @@ def download_youtube_video(youtube_url: str, output_dir: str) -> str:
         downloaded_path = ydl.prepare_filename(info)
 
     if not os.path.exists(downloaded_path):
-        raise FileNotFoundError(f"YouTube video was not downloaded: {downloaded_path}")
+        raise FileNotFoundError(
+            f"YouTube video was not downloaded: {downloaded_path}"
+        )
 
     return downloaded_path
 
@@ -155,16 +160,21 @@ def fetch_google_creative_assets_from_clickhouse(
     where_parts = [
         """
         (
-            (asset_type = 'IMAGE' AND image_url IS NOT NULL AND image_url != '')
+            (asset_type = 'IMAGE'
+             AND image_url IS NOT NULL
+             AND image_url != '')
             OR
-            (asset_type = 'YOUTUBE_VIDEO' AND youtube_video_url IS NOT NULL AND youtube_video_url != '')
+            (asset_type = 'YOUTUBE_VIDEO'
+             AND youtube_video_url IS NOT NULL
+             AND youtube_video_url != '')
         )
         """,
         "campaign_status != 'REMOVED'",
         "(ad_status IS NULL OR ad_status != 'REMOVED')",
         "(ad_group_status IS NULL OR ad_group_status != 'REMOVED')",
         "(asset_group_status IS NULL OR asset_group_status != 'REMOVED')",
-        "(asset_group_asset_status IS NULL OR asset_group_asset_status != 'REMOVED')",
+        "(asset_group_asset_status IS NULL"
+        " OR asset_group_asset_status != 'REMOVED')",
     ]
 
     if customer_id:
@@ -213,7 +223,7 @@ def fetch_google_creative_assets_from_clickhouse(
         youtube_video_id,
         youtube_video_url,
         youtube_video_title
-    FROM google_ads.google_ads_creative_assets
+    FROM google_ads_core.google_ads_core_creative_assets
     WHERE {" AND ".join(where_parts)}
     ORDER BY campaign_id, asset_id, source_type
     {limit_sql}
@@ -542,7 +552,9 @@ def run_google_embeddings(
     failed = 0
 
     try:
-        with tempfile.TemporaryDirectory(prefix="google_ads_embeddings_") as temp_dir:
+        with tempfile.TemporaryDirectory(
+            prefix="google_ads_embeddings_"
+        ) as temp_dir:
             for asset in assets:
                 asset_type = asset.get("asset_type")
 

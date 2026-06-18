@@ -1,3 +1,21 @@
+"""
+main.py
+
+Точка входа ETL-пайплайна Google Ads.
+
+Режимы запуска (управляются через .env):
+- BACKFILL_MODE=True  — полная выгрузка за диапазон дат (BACKFILL_START_DATE
+                        по BACKFILL_END_DATE или вчера), батчами по
+                        BACKFILL_BATCH_DAYS дней.
+- BACKFILL_MODE=False — ежедневный запуск (дефолт): выгрузка за вчерашний
+                        день, запускается по cron.
+
+Шаги пайплайна для каждого батча:
+1. fetch_and_save_raw  — выгрузка из Google Ads API + сохранение в raw DB
+2. save_staging        — удаление старых и вставка новых строк в staging DB
+3. staging_to_core     — перекладывание из staging в core DB
+"""
+
 import os
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -84,15 +102,6 @@ def get_optional_int_env(name: str) -> int | None:
         return None
 
     return int(value)
-
-
-def get_bool_env(name: str, default: bool = True) -> bool:
-    value = os.getenv(name)
-
-    if value is None or not value.strip():
-        return default
-
-    return value.strip().lower() not in ("0", "false", "no", "off")
 
 
 def run_embeddings_after_pipeline(
@@ -224,21 +233,33 @@ def run_pipeline_for_period(
         f"customer_id={customer_id}, "
         f"{date_since} -> {date_until}"
     )
- 
+
     total_raw_rows = 0
     total_staging_rows = 0
- 
+
+    fetch_creative_assets = config.get_bool_env(
+        "GOOGLE_FETCH_CREATIVE_ASSETS",
+        default=True,
+    )
+
+    creative_assets_response_data = {
+        "rows_count": 0,
+        "data": [],
+        "skipped": True,
+    }
+    creative_asset_rows: list[list] = []
+
     # ----------------------------------------------------------
-    # Шаг 1: fetch_raw — выгрузка из Google API
+    # Шаг 1: fetch_and_save_raw — выгрузка из Google API + сохранение в raw
     # ----------------------------------------------------------
     with etl_logger.etl_step(
         run_id=run_id,
-        step_name="fetch_raw",
+        step_name="fetch_and_save_raw",
         step_order=1,
         target_database=config.CLICKHOUSE_RAW_DB,
         target_table="raw_data",
     ) as step:
- 
+
         hourly_response_data, hourly_grouped_rows = (
             google_ads_api.fetch_ad_hourly_data(
                 customer_id=customer_id,
@@ -246,7 +267,7 @@ def run_pipeline_for_period(
                 date_until=date_until,
             )
         )
- 
+
         daily_response_data, daily_grouped_rows = (
             google_ads_api.fetch_ad_group_ad_daily_data(
                 customer_id=customer_id,
@@ -254,7 +275,7 @@ def run_pipeline_for_period(
                 date_until=date_until,
             )
         )
- 
+
         daily_geo_response_data, daily_geo_rows = (
             google_ads_api.fetch_geo_daily_data(
                 customer_id=customer_id,
@@ -262,27 +283,23 @@ def run_pipeline_for_period(
                 date_until=date_until,
             )
         )
- 
-        daily_campaign_response_data, (
-            daily_campaign_grouped_rows
-        ) = (
+
+        daily_campaign_response_data, daily_campaign_grouped_rows = (
             google_ads_api.fetch_daily_campaign_data(
                 customer_id=customer_id,
                 date_since=date_since,
                 date_until=date_until,
             )
         )
- 
-        daily_search_term_response_data, (
-            daily_search_term_rows
-        ) = (
+
+        daily_search_term_response_data, daily_search_term_rows = (
             google_ads_api.fetch_daily_search_term_data(
                 customer_id=customer_id,
                 date_since=date_since,
                 date_until=date_until,
             )
         )
- 
+
         gender_daily_response_data, gender_daily_rows = (
             google_ads_api.fetch_gender_daily_data(
                 customer_id=customer_id,
@@ -290,52 +307,14 @@ def run_pipeline_for_period(
                 date_until=date_until,
             )
         )
- 
-        fetch_creative_assets = get_bool_env(
-            "GOOGLE_FETCH_CREATIVE_ASSETS",
-            default=True,
-        )
- 
-        creative_assets_response_data = {
-            "rows_count": 0,
-            "data": [],
-            "skipped": True,
-        }
-        creative_asset_rows: list[list] = []
- 
+
         if fetch_creative_assets:
-            creative_assets_response_data, (
-                creative_asset_rows
-            ) = (
+            creative_assets_response_data, creative_asset_rows = (
                 google_ads_api.fetch_creative_assets_data(
                     customer_id=customer_id,
                 )
             )
- 
-        raw_count = (
-            hourly_response_data["rows_count"]
-            + daily_response_data["rows_count"]
-            + daily_geo_response_data["rows_count"]
-            + daily_campaign_response_data["rows_count"]
-            + daily_search_term_response_data["rows_count"]
-            + gender_daily_response_data["rows_count"]
-            + creative_assets_response_data["rows_count"]
-        )
-        step["input_rows"] = raw_count
-        step["output_rows"] = raw_count
-        total_raw_rows = raw_count
- 
-    # ----------------------------------------------------------
-    # Шаг 2: raw_to_staging
-    # ----------------------------------------------------------
-    with etl_logger.etl_step(
-        run_id=run_id,
-        step_name="raw_to_staging",
-        step_order=2,
-        target_database=config.CLICKHOUSE_STAGING_DB,
-    ) as step:
- 
-        # raw_data (append-only)
+
         insert_raw_response(
             customer_id=customer_id,
             query_name="ad_hourly",
@@ -349,13 +328,11 @@ def run_pipeline_for_period(
                 "granularity": "hourly_campaign_level",
             },
         )
- 
+
         insert_raw_response(
             customer_id=customer_id,
             query_name="ad_group_ad_daily",
-            query_text=(
-                google_ads_api.queries.AD_GROUP_AD_DAILY_QUERY
-            ),
+            query_text=google_ads_api.queries.AD_GROUP_AD_DAILY_QUERY,
             response_data=daily_response_data,
             request_params={
                 "customer_id": customer_id,
@@ -365,7 +342,7 @@ def run_pipeline_for_period(
                 "granularity": "daily_ad_level",
             },
         )
- 
+
         insert_raw_response(
             customer_id=customer_id,
             query_name="geo_daily",
@@ -379,13 +356,11 @@ def run_pipeline_for_period(
                 "granularity": "geo_daily_region_level",
             },
         )
- 
+
         insert_raw_response(
             customer_id=customer_id,
             query_name="daily_campaign",
-            query_text=(
-                google_ads_api.queries.DAILY_CAMPAIGN_QUERY
-            ),
+            query_text=google_ads_api.queries.DAILY_CAMPAIGN_QUERY,
             response_data=daily_campaign_response_data,
             request_params={
                 "customer_id": customer_id,
@@ -395,13 +370,11 @@ def run_pipeline_for_period(
                 "granularity": "daily_campaign_level",
             },
         )
- 
+
         insert_raw_response(
             customer_id=customer_id,
             query_name="daily_search_term",
-            query_text=(
-                google_ads_api.queries.SEARCH_TERM_DAILY_QUERY
-            ),
+            query_text=google_ads_api.queries.SEARCH_TERM_DAILY_QUERY,
             response_data=daily_search_term_response_data,
             request_params={
                 "customer_id": customer_id,
@@ -411,13 +384,11 @@ def run_pipeline_for_period(
                 "granularity": "daily_search_term_level",
             },
         )
- 
+
         insert_raw_response(
             customer_id=customer_id,
             query_name="gender_daily",
-            query_text=(
-                google_ads_api.queries.GENDER_DAILY_QUERY
-            ),
+            query_text=google_ads_api.queries.GENDER_DAILY_QUERY,
             response_data=gender_daily_response_data,
             request_params={
                 "customer_id": customer_id,
@@ -427,17 +398,15 @@ def run_pipeline_for_period(
                 "granularity": "gender_daily_level",
             },
         )
- 
+
         if fetch_creative_assets:
             insert_raw_response(
                 customer_id=customer_id,
                 query_name="creative_assets",
                 query_text=(
-                    google_ads_api.queries
-                    .AD_GROUP_AD_ASSET_QUERY
+                    google_ads_api.queries.AD_GROUP_AD_ASSET_QUERY
                     + "\n\n-- asset_group_asset\n\n"
-                    + google_ads_api.queries
-                    .ASSET_GROUP_ASSET_QUERY
+                    + google_ads_api.queries.ASSET_GROUP_ASSET_QUERY
                 ),
                 response_data=creative_assets_response_data,
                 request_params={
@@ -449,8 +418,30 @@ def run_pipeline_for_period(
                     "granularity": "creative_asset_level",
                 },
             )
- 
-        # Staging: delete + insert
+
+        raw_count = (
+            hourly_response_data["rows_count"]
+            + daily_response_data["rows_count"]
+            + daily_geo_response_data["rows_count"]
+            + daily_campaign_response_data["rows_count"]
+            + daily_search_term_response_data["rows_count"]
+            + gender_daily_response_data["rows_count"]
+            + creative_assets_response_data["rows_count"]
+        )
+        step["input_rows"] = raw_count
+        step["output_rows"] = raw_count
+        total_raw_rows = raw_count
+
+    # ----------------------------------------------------------
+    # Шаг 2: save_staging — удаление старых и вставка новых строк в staging
+    # ----------------------------------------------------------
+    with etl_logger.etl_step(
+        run_id=run_id,
+        step_name="save_staging",
+        step_order=2,
+        target_database=config.CLICKHOUSE_STAGING_DB,
+    ) as step:
+
         clickhouse_db.delete_goal_tables_for_period(
             customer_id=customer_id,
             date_since=date_since,
@@ -461,7 +452,7 @@ def run_pipeline_for_period(
             row_type="hourly",
             insert_func=clickhouse_db.insert_goal_rows,
         )
- 
+
         clickhouse_db.delete_daily_tables_for_period(
             customer_id=customer_id,
             date_since=date_since,
@@ -472,7 +463,7 @@ def run_pipeline_for_period(
             row_type="daily",
             insert_func=clickhouse_db.insert_daily_rows,
         )
- 
+
         clickhouse_db.delete_daily_geo_table_for_period(
             customer_id=customer_id,
             date_since=date_since,
@@ -481,7 +472,7 @@ def run_pipeline_for_period(
         clickhouse_db.insert_daily_geo_rows(
             rows=daily_geo_rows,
         )
- 
+
         clickhouse_db.delete_daily_campaign_tables_for_period(
             customer_id=customer_id,
             date_since=date_since,
@@ -490,11 +481,9 @@ def run_pipeline_for_period(
         insert_grouped_rows(
             grouped_rows=daily_campaign_grouped_rows,
             row_type="daily_campaign",
-            insert_func=(
-                clickhouse_db.insert_daily_campaign_rows
-            ),
+            insert_func=clickhouse_db.insert_daily_campaign_rows,
         )
- 
+
         clickhouse_db.delete_daily_search_term_table_for_period(
             customer_id=customer_id,
             date_since=date_since,
@@ -503,7 +492,7 @@ def run_pipeline_for_period(
         clickhouse_db.insert_daily_search_term_rows(
             rows=daily_search_term_rows,
         )
- 
+
         clickhouse_db.delete_gender_daily_table_for_period(
             customer_id=customer_id,
             date_since=date_since,
@@ -512,7 +501,7 @@ def run_pipeline_for_period(
         clickhouse_db.insert_gender_daily_rows(
             rows=gender_daily_rows,
         )
- 
+
         if fetch_creative_assets:
             clickhouse_db.delete_creative_assets_for_customer(
                 customer_id=customer_id,
@@ -520,32 +509,24 @@ def run_pipeline_for_period(
             clickhouse_db.insert_creative_asset_rows(
                 rows=creative_asset_rows,
             )
- 
+
         staging_count = (
-            sum(
-                len(rows)
-                for rows in hourly_grouped_rows.values()
-            )
-            + sum(
-                len(rows)
-                for rows in daily_grouped_rows.values()
-            )
+            sum(len(rows) for rows in hourly_grouped_rows.values())
+            + sum(len(rows) for rows in daily_grouped_rows.values())
             + len(daily_geo_rows)
             + sum(
                 len(rows)
-                for rows in (
-                    daily_campaign_grouped_rows.values()
-                )
+                for rows in daily_campaign_grouped_rows.values()
             )
             + len(daily_search_term_rows)
             + len(gender_daily_rows)
             + len(creative_asset_rows)
         )
- 
+
         step["input_rows"] = total_raw_rows
         step["output_rows"] = staging_count
         total_staging_rows = staging_count
- 
+
     # ----------------------------------------------------------
     # Шаг 3: staging_to_core
     # ----------------------------------------------------------
@@ -556,29 +537,29 @@ def run_pipeline_for_period(
         date_until=date_until,
         load_creatives=fetch_creative_assets,
     )
- 
+
     print(
         f"Finished Google Ads period: "
         f"customer_id={customer_id}, "
         f"{date_since} -> {date_until}"
     )
- 
+
     return total_raw_rows, total_staging_rows, total_core_rows
 
 
 def main() -> None:
     config.validate_config()
- 
+
     customer_ids = config.GOOGLE_ADS_CUSTOMER_IDS
- 
-    only_creative_assets = get_bool_env(
+
+    only_creative_assets = config.get_bool_env(
         "GOOGLE_ONLY_CREATIVE_ASSETS",
         default=False,
     )
- 
+
     if only_creative_assets:
         print("Google Ads creative assets only mode started")
- 
+
         for customer_id in customer_ids:
             run_id = etl_logger.create_run(
                 run_type="creative_assets_only",
@@ -586,7 +567,7 @@ def main() -> None:
                 date_until="2099-12-31",
             )
             started_at = datetime.now(ALMATY_TZ)
- 
+
             try:
                 run_creative_assets_only(
                     customer_id=customer_id,
@@ -607,10 +588,10 @@ def main() -> None:
                     error_trace=traceback.format_exc(),
                 )
                 raise
- 
+
         print("Google Ads creative assets only mode finished")
         return
- 
+
     if config.BACKFILL_MODE:
         date_since = config.BACKFILL_START_DATE
         date_until = (
@@ -623,24 +604,24 @@ def main() -> None:
         date_until = get_yesterday()
         batch_days = 1
         run_type = "daily"
- 
+
     batches = iter_date_batches(
         start_date=date_since,
         end_date=date_until,
         batch_days=batch_days,
     )
- 
+
     print(
         f"Google Ads {run_type} started: "
         f"{date_since} -> {date_until}, "
         f"batches={len(batches)}"
     )
- 
+
     for customer_id in customer_ids:
         total_raw = 0
         total_staging = 0
         total_core = 0
- 
+
         # Один run_id на весь customer за все батчи
         run_id = etl_logger.create_run(
             run_type=run_type,
@@ -648,7 +629,7 @@ def main() -> None:
             date_until=date_until,
         )
         started_at = datetime.now(ALMATY_TZ)
- 
+
         try:
             for batch_since, batch_until in batches:
                 raw, staging, _ = (
@@ -662,17 +643,17 @@ def main() -> None:
                 )
                 total_raw += raw
                 total_staging += staging
- 
+
             run_embeddings_after_pipeline(
                 customer_id=customer_id,
             )
- 
+
             # Считаем фактические строки в core
             total_core = core_loader.count_core_rows(
                 date_since=date_since,
                 date_until=date_until,
             )
- 
+
             etl_logger.finish_run(
                 run_id=run_id,
                 started_at=started_at,
@@ -683,7 +664,7 @@ def main() -> None:
                 actual_min_date=date_since,
                 actual_max_date=date_until,
             )
- 
+
         except Exception as e:
             import traceback
             etl_logger.finish_run(
@@ -697,7 +678,7 @@ def main() -> None:
                 error_trace=traceback.format_exc(),
             )
             raise
- 
+
     print(f"Google Ads {run_type} finished")
 
 

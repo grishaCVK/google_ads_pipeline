@@ -13,7 +13,6 @@ core_loader.py
 6. Quality checks
 """
 
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import clickhouse_connect
@@ -832,7 +831,6 @@ def load_creative_assets(
     staging_table = "google_ads_creative_assets_staging"
 
     client_core = _get_client(CORE_DB)
-    client_staging = _get_client(STAGING_DB)
 
     rows_before_result = client_core.query(
         f"SELECT count() FROM {CORE_DB}.{table} "

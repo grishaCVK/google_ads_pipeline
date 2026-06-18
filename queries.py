@@ -1,3 +1,11 @@
+"""
+queries.py
+
+GAQL-запросы к Google Ads API.
+Каждая константа — готовый запрос (или шаблон с .format()),
+передаётся в google_ads_service.search() / search_stream().
+"""
+
 AD_HOURLY_QUERY = """
 SELECT
   segments.date,
@@ -862,6 +870,15 @@ SELECT
 FROM gender_view
 WHERE segments.date BETWEEN '{date_since}' AND '{date_until}'
 """
+
+CAMPAIGN_GOALS_QUERY = """
+SELECT
+  campaign.id,
+  campaign_goal.goal_type
+FROM campaign_goal
+WHERE campaign.status != 'REMOVED'
+"""
+
 
 DIRECT_IMAGE_AD_CREATIVE_QUERY = """
 SELECT

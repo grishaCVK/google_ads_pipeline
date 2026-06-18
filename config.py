@@ -1,3 +1,10 @@
+"""
+config.py
+
+Конфигурация пайплайна из переменных окружения (.env).
+Все настройки читаются при импорте модуля.
+"""
+
 import os
 
 from dotenv import load_dotenv
@@ -18,7 +25,9 @@ GOOGLE_ADS_DEVELOPER_TOKEN = os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN")
 GOOGLE_ADS_CLIENT_ID = os.getenv("GOOGLE_ADS_CLIENT_ID")
 GOOGLE_ADS_CLIENT_SECRET = os.getenv("GOOGLE_ADS_CLIENT_SECRET")
 GOOGLE_ADS_REFRESH_TOKEN = os.getenv("GOOGLE_ADS_REFRESH_TOKEN")
-GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or None
+GOOGLE_ADS_LOGIN_CUSTOMER_ID = (
+    os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or None
+)
 
 _raw_customer_ids = os.getenv("GOOGLE_ADS_CUSTOMER_IDS", "")
 GOOGLE_ADS_CUSTOMER_IDS = [
@@ -33,7 +42,9 @@ CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "clickhouse")
 
 CLICKHOUSE_RAW_DB = os.getenv("CLICKHOUSE_RAW_DB", "google_ads_raw")
-CLICKHOUSE_STAGING_DB = os.getenv("CLICKHOUSE_STAGING_DB", "google_ads_staging")
+CLICKHOUSE_STAGING_DB = os.getenv(
+    "CLICKHOUSE_STAGING_DB", "google_ads_staging"
+)
 CLICKHOUSE_CORE_DB = os.getenv("CLICKHOUSE_CORE_DB", "google_ads_core")
 CLICKHOUSE_METADATA_DB = os.getenv("CLICKHOUSE_METADATA_DB", "etl_metadata")
 
@@ -43,7 +54,7 @@ POSTGRES_DB = os.getenv("POSTGRES_DB", "google_ads_embeddings")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
 
-BACKFILL_MODE = get_bool_env("BACKFILL_MODE", True)
+BACKFILL_MODE = get_bool_env("BACKFILL_MODE", False)
 BACKFILL_START_DATE = os.getenv("BACKFILL_START_DATE") or None
 BACKFILL_END_DATE = os.getenv("BACKFILL_END_DATE") or None
 BACKFILL_BATCH_DAYS = int(os.getenv("BACKFILL_BATCH_DAYS", "1"))

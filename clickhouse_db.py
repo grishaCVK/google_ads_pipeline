@@ -45,10 +45,6 @@ DAILY_TABLES = [
 
 DAILY_GEO_TABLE = "google_ads_geo_daily_region_level_staging"
 
-DAILY_GEO_TABLES = [
-    DAILY_GEO_TABLE,
-]
-
 DAILY_CAMPAIGN_TABLES = [
     "google_ads_sales_daily_campaign_level_staging",
     "google_ads_leads_daily_campaign_level_staging",
@@ -949,8 +945,6 @@ GENDER_DAILY_TABLE_COLUMNS = [
     "loaded_at",
 ]
 
-GOAL_TABLE_COLUMNS = HOURLY_TABLE_COLUMNS
-
 
 RAW_COLUMNS = [
     "raw_id",
@@ -1021,6 +1015,61 @@ def insert_raw_data(
         [row],
         column_names=RAW_COLUMNS,
     )
+
+
+# ============================================================
+# RAW read — источник для staging-загрузки
+# ============================================================
+
+def read_raw(
+    *,
+    query_name: str,
+    customer_id: str,
+    date_since: str | None = None,
+    date_until: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Читает сырые строки из raw_data.
+
+    Каждый fetch пишет одну запись raw_data (response_json со
+    списком строк под ключом "rows"). Берём самую свежую запись
+    за период и возвращаем её список строк.
+    """
+    client = get_raw_client()
+
+    conditions = [
+        f"query_name = '{query_name}'",
+        f"customer_id = '{customer_id}'",
+    ]
+
+    if date_since and date_until:
+        conditions.append(
+            "JSONExtractString(request_params, 'date_since') = "
+            f"'{date_since}'"
+        )
+        conditions.append(
+            "JSONExtractString(request_params, 'date_until') = "
+            f"'{date_until}'"
+        )
+
+    where_sql = " AND ".join(conditions)
+
+    sql = f"""
+    SELECT response_json
+    FROM raw_data
+    WHERE {where_sql}
+    ORDER BY fetched_at DESC
+    LIMIT 1
+    """
+
+    result = client.query(sql)
+
+    if not result.result_rows:
+        return []
+
+    payload = json.loads(result.result_rows[0][0])
+
+    return payload.get("rows", [])
 
 
 # ============================================================

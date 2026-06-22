@@ -24,12 +24,6 @@ ALMATY_TZ = ZoneInfo("Asia/Almaty")
 PIPELINE_NAME = "google_ads_pipeline"
 SOURCE_PLATFORM = "google_ads"
 
-# Порядок шагов
-STEP_FETCH_RAW = ("fetch_raw", 1)
-STEP_RAW_TO_STAGING = ("raw_to_staging", 2)
-STEP_STAGING_TO_CORE = ("staging_to_core", 3)
-STEP_DATA_QUALITY = ("data_quality", 4)
-
 
 def _now() -> datetime:
     return datetime.now(ALMATY_TZ)
@@ -47,51 +41,6 @@ def _get_client():
         password=config.CLICKHOUSE_PASSWORD,
         database=config.CLICKHOUSE_METADATA_DB,
     )
-
-
-def _count_rows(
-    *,
-    database: str,
-    table: str,
-    customer_id: str,
-    date_since: str,
-    date_until: str,
-) -> int:
-    """Считает строки в таблице за период."""
-    client = _get_client()
-
-    # raw_data — по fetched_at, остальные по date_start
-    if table == "raw_data":
-        sql = f"""
-        SELECT count()
-        FROM {database}.{table}
-        WHERE customer_id = '{customer_id}'
-          AND toDate(fetched_at) BETWEEN
-              toDate('{date_since}') AND toDate('{date_until}')
-        """
-    else:
-        sql = f"""
-        SELECT count()
-        FROM {database}.{table}
-        WHERE customer_id = '{customer_id}'
-          AND toDate(date_start) BETWEEN
-              toDate('{date_since}') AND toDate('{date_until}')
-        """
-
-    result = client.query(sql)
-    return result.first_row[0]
-
-
-def _count_rows_no_filter(
-    *,
-    database: str,
-    table: str,
-) -> int:
-    """Считает все строки в таблице (для core)."""
-    client = _get_client()
-    sql = f"SELECT count() FROM {database}.{table}"
-    result = client.query(sql)
-    return result.first_row[0]
 
 
 # ============================================================

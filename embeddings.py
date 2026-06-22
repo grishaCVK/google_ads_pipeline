@@ -1,3 +1,13 @@
+"""
+embeddings.py
+
+Векторные эмбеддинги креативов Google Ads.
+Читает креативы из core (google_ads_core_creative_assets),
+скачивает картинки и кадры YouTube-видео, считает CLIP-эмбеддинги
+и пишет их в Postgres (pgvector). Запускается после основного
+пайплайна; управляется GOOGLE_EMBEDDINGS_ENABLED.
+"""
+
 import os
 import tempfile
 from datetime import datetime, timezone

@@ -1,21 +1,23 @@
 """
 google_ads_api.py
 
-Выгрузка данных из Google Ads API и формирование строк для ClickHouse:
-- fetch_campaign_goals()              — цели кампаний (campaign_goal.goal_type)
-- fetch_campaign_budget_info_*()      — бюджеты и биддинг
-- fetch_ad_hourly_data()              — метрики по часам на уровне кампании
-- fetch_ad_group_ad_daily_data()      — метрики по дням на уровне объявления
-- fetch_geo_daily_data()              — гео-метрики по дням
-- fetch_daily_campaign_data()         — метрики по дням на уровне кампании
-- fetch_daily_search_term_data()      — поисковые запросы по дням
-- fetch_gender_daily_data()           — метрики по полу по дням
-- fetch_creative_assets_data()        — креативы и ассеты
+Доступ к Google Ads API. Делится на две части:
 
-Цель кампании определяется по campaign_goal.goal_type (приоритет:
-SALES > LEADS > APP_PROMOTION > WEBSITE_TRAFFIC > BRAND_AWARENESS >
-LOCAL_STORE_VISITS). При отсутствии цели — fallback по
-advertising_channel_type.
+1. fetch_*_data() — выгружают сырой ответ API (response_json со
+   списком строк) и больше ничего: используются на шаге 1 (raw).
+   - fetch_ad_hourly_data, fetch_ad_group_ad_daily_data,
+     fetch_geo_daily_data, fetch_daily_campaign_data,
+     fetch_daily_search_term_data, fetch_gender_daily_data,
+     fetch_creative_assets_data.
+
+2. build_*_clickhouse_row() + размерные fetch (бюджеты, гео-
+   константы, YouTube-метаданные) — превращают строку API в строку
+   staging-таблицы. Вызываются из google_staging_loader на шаге 2,
+   на вход им подаётся dict из raw (обёрнутый в _W).
+
+Корзина (таблица) кампании определяется по advertising_channel_type
+(карта _CHANNEL_TYPE_TO_PREFIX), т.к. «цель» кампании в Google Ads
+API недоступна. PERFORMANCE_MAX и неизвестные каналы → no_goal.
 """
 
 import json
@@ -34,46 +36,22 @@ import queries
 
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
 
-# campaign_goal.goal_type → table prefix
-_GOAL_TYPE_TO_PREFIX: dict[str, str] = {
-    "SALES": "google_ads_sales",
-    "LEADS": "google_ads_leads",
-    "WEBSITE_TRAFFIC": "google_ads_website_traffic",
-    "APP_PROMOTION": "google_ads_app_promotion",
-    "BRAND_AWARENESS_AND_CONSIDERATION": (
-        "google_ads_youtube_reach_views_engagement"
-    ),
-    "LOCAL_STORE_VISITS_AND_PROMOTIONS": (
-        "google_ads_store_visits_promotions"
-    ),
-}
-
-# Priority when a campaign has multiple goals (e.g. PMax)
-_GOAL_PRIORITY: list[str] = [
-    "SALES",
-    "LEADS",
-    "APP_PROMOTION",
-    "WEBSITE_TRAFFIC",
-    "BRAND_AWARENESS_AND_CONSIDERATION",
-    "LOCAL_STORE_VISITS_AND_PROMOTIONS",
-]
-
-# Fallback when no campaign_goal exists: advertising_channel_type → prefix
+# Классификация по advertising_channel_type → префикс таблицы.
+# Цели кампаний (Sales/Leads/Traffic) в Google Ads API не доступны,
+# поэтому корзина определяется по типу канала. PERFORMANCE_MAX
+# объединяет все каналы и не несёт информации о цели → no_goal.
 _CHANNEL_TYPE_TO_PREFIX: dict[str, str] = {
     "VIDEO": "google_ads_youtube_reach_views_engagement",
     "MULTI_CHANNEL": "google_ads_app_promotion",
     "SHOPPING": "google_ads_sales",
     "SMART": "google_ads_store_visits_promotions",
     "LOCAL": "google_ads_store_visits_promotions",
+    "LOCAL_SERVICES": "google_ads_store_visits_promotions",
     "SEARCH": "google_ads_website_traffic",
     "DISPLAY": "google_ads_website_traffic",
-    "PERFORMANCE_MAX": "google_ads_website_traffic",
     "DEMAND_GEN": "google_ads_website_traffic",
     "DISCOVERY": "google_ads_website_traffic",
 }
-
-# campaign_id -> [goal_type, ...] — fetched once per customer per run
-_CAMPAIGN_GOALS_CACHE: dict[str, dict[str, list[str]]] = {}
 
 # campaign_id -> budget info — fetched once per customer per run
 _CAMPAIGN_BUDGET_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
@@ -106,19 +84,6 @@ def micros_to_money(value: int | float | None) -> float | None:
         return None
 
 
-def safe_divide(
-    numerator: float | int | None,
-    denominator: float | int | None,
-) -> float | None:
-    if numerator is None or denominator in (None, 0):
-        return None
-
-    try:
-        return float(numerator) / float(denominator)
-    except (TypeError, ValueError, ZeroDivisionError):
-        return None
-
-
 def enum_name(value: Any) -> str | None:
     if value is None:
         return None
@@ -128,7 +93,7 @@ def enum_name(value: Any) -> str | None:
     if name:
         return name
 
-    return str(value)
+    return str(value) or None
 
 
 def enum_list_to_names(values: Any) -> list[str]:
@@ -250,79 +215,29 @@ def get_daily_datetime_range(row: Any) -> tuple[datetime, datetime]:
     return date_start, date_stop
 
 
-def safe_int(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
-def safe_float(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def row_has_field(row: Any, path: str) -> bool:
-    current = row
-
-    for item in path.split("."):
-        if not hasattr(current, item):
-            return False
-
-        current = getattr(current, item)
-
-    return True
-
-
-def _get_goal_prefix(
-    campaign_id: str,
-    goals_map: dict[str, list[str]],
-    channel_type: str,
-) -> str:
-    goals = goals_map.get(campaign_id, [])
-    for goal in _GOAL_PRIORITY:
-        if goal in goals:
-            return _GOAL_TYPE_TO_PREFIX[goal]
+def _get_goal_prefix(channel_type: str) -> str:
     return _CHANNEL_TYPE_TO_PREFIX.get(
         channel_type, "google_ads_no_goal"
     )
 
 
-def get_hourly_table(
-    campaign_id: str,
-    goals_map: dict[str, list[str]],
-    channel_type: str,
-) -> str:
-    prefix = _get_goal_prefix(campaign_id, goals_map, channel_type)
+def get_hourly_table(channel_type: str) -> str:
+    prefix = _get_goal_prefix(channel_type)
     return f"{prefix}_hourly_campaign_level_staging"
 
 
-def get_daily_ad_table(
-    campaign_id: str,
-    goals_map: dict[str, list[str]],
-    channel_type: str,
-) -> str:
-    prefix = _get_goal_prefix(campaign_id, goals_map, channel_type)
+def get_daily_ad_table(channel_type: str) -> str:
+    prefix = _get_goal_prefix(channel_type)
     return f"{prefix}_daily_ad_level_staging"
 
 
-def get_daily_campaign_table(
-    campaign_id: str,
-    goals_map: dict[str, list[str]],
-    channel_type: str,
-) -> str:
-    prefix = _get_goal_prefix(campaign_id, goals_map, channel_type)
+def get_daily_campaign_table(channel_type: str) -> str:
+    prefix = _get_goal_prefix(channel_type)
     return f"{prefix}_daily_campaign_level_staging"
 
 
-def get_goal_type_str(
-    campaign_id: str,
-    goals_map: dict[str, list[str]],
-    channel_type: str,
-) -> str:
-    prefix = _get_goal_prefix(campaign_id, goals_map, channel_type)
+def get_goal_type_str(channel_type: str) -> str:
+    prefix = _get_goal_prefix(channel_type)
     return prefix.removeprefix("google_ads_")
 
 
@@ -488,43 +403,6 @@ def fetch_targeted_locations_by_campaign(
     return result
 
 
-def fetch_campaign_goals(
-    *,
-    customer_id: str,
-) -> dict[str, list[str]]:
-    if customer_id in _CAMPAIGN_GOALS_CACHE:
-        return _CAMPAIGN_GOALS_CACHE[customer_id]
-
-    client = get_client()
-    google_ads_service = client.get_service("GoogleAdsService")
-    result: dict[str, list[str]] = {}
-
-    try:
-        response = google_ads_service.search(
-            customer_id=customer_id,
-            query=queries.CAMPAIGN_GOALS_QUERY,
-        )
-        for row in response:
-            campaign_id = str(row.campaign.id)
-            goal_type = enum_name(row.campaign_goal.goal_type)
-            if goal_type and goal_type not in (
-                "UNSPECIFIED", "UNKNOWN", "None", ""
-            ):
-                result.setdefault(campaign_id, []).append(goal_type)
-
-    except GoogleAdsException as ex:
-        print("Google Ads campaign goals fetch failed")
-        print(f"Request ID: {ex.request_id}")
-        print(f"Status: {ex.error.code().name}")
-        for error in ex.failure.errors:
-            print(f"Error: {error.message}")
-        _CAMPAIGN_GOALS_CACHE[customer_id] = {}
-        return {}
-
-    _CAMPAIGN_GOALS_CACHE[customer_id] = result
-    return result
-
-
 def fetch_campaign_budget_info_by_campaign(
     *,
     customer_id: str,
@@ -609,18 +487,11 @@ def fetch_campaign_budget_info_by_campaign(
     return result
 
 
-def build_clickhouse_row(
-    row: Any,
-    *,
-    campaign_goals_map: dict[str, list[str]],
-) -> tuple[str, list[Any]]:
+def build_clickhouse_row(row: Any) -> tuple[str, list[Any]]:
     date_start, date_stop = get_hourly_datetime_range(row)
 
-    campaign_id = str(row.campaign.id)
     channel_type = enum_name(row.campaign.advertising_channel_type) or ""
-    table_name = get_hourly_table(
-        campaign_id, campaign_goals_map, channel_type
-    )
+    table_name = get_hourly_table(channel_type)
 
     # Micros -> money. Это не бизнес-расчет метрики,
     # а техническая конвертация из micros в нормальную валюту.
@@ -686,9 +557,7 @@ def build_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_goal_type_str(
-            campaign_id, campaign_goals_map, channel_type
-        ),
+        "google_ads_goal_type": get_goal_type_str(channel_type),
 
         "device": enum_name(row.segments.device),
 
@@ -909,15 +778,12 @@ def build_ad_group_ad_daily_clickhouse_row(
     row: Any,
     *,
     campaign_budget_info_by_campaign: dict[str, dict[str, Any]],
-    campaign_goals_map: dict[str, list[str]],
 ) -> tuple[str, list[Any]]:
     date_start, date_stop = get_daily_datetime_range(row)
 
     campaign_id = str(row.campaign.id)
     channel_type = enum_name(row.campaign.advertising_channel_type) or ""
-    table_name = get_daily_ad_table(
-        campaign_id, campaign_goals_map, channel_type
-    )
+    table_name = get_daily_ad_table(channel_type)
 
     # Micros -> money. Это не бизнес-расчет метрики,
     # а техническая конвертация из micros в нормальную валюту.
@@ -1044,9 +910,7 @@ def build_ad_group_ad_daily_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_goal_type_str(
-            campaign_id, campaign_goals_map, channel_type
-        ),
+        "google_ads_goal_type": get_goal_type_str(channel_type),
 
         "ad_group_id": str(row.ad_group.id),
         "ad_group_name": row.ad_group.name or None,
@@ -1365,7 +1229,6 @@ def build_geo_daily_clickhouse_row(
     geo_constants_map: dict[str, dict[str, Any]],
     targeted_locations_by_campaign: dict[str, str],
     campaign_budget_info_by_campaign: dict[str, dict[str, Any]],
-    campaign_goals_map: dict[str, list[str]],
 ) -> list[Any]:
     date_start, date_stop = get_daily_datetime_range(row)
 
@@ -1429,9 +1292,7 @@ def build_geo_daily_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_goal_type_str(
-            campaign_id, campaign_goals_map, channel_type
-        ),
+        "google_ads_goal_type": get_goal_type_str(channel_type),
 
         "geo_location_name": (
             city_info.get("name")
@@ -1553,16 +1414,12 @@ def build_geo_daily_clickhouse_row(
 
 def build_daily_campaign_clickhouse_row(
     row: Any,
-    *,
-    campaign_goals_map: dict[str, list[str]],
 ) -> tuple[str, list[Any]]:
     date_start, date_stop = get_daily_datetime_range(row)
 
     campaign_id = str(row.campaign.id)
     channel_type = enum_name(row.campaign.advertising_channel_type) or ""
-    table_name = get_daily_campaign_table(
-        campaign_id, campaign_goals_map, channel_type
-    )
+    table_name = get_daily_campaign_table(channel_type)
 
     # Micros -> money. Это не бизнес-расчет метрики,
     # а техническая конвертация из micros в нормальную валюту.
@@ -1704,9 +1561,7 @@ def build_daily_campaign_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_goal_type_str(
-            campaign_id, campaign_goals_map, channel_type
-        ),
+        "google_ads_goal_type": get_goal_type_str(channel_type),
 
         "budget_id": (
             str(row.campaign_budget.id)
@@ -2207,7 +2062,6 @@ def build_daily_search_term_clickhouse_row(
     row: Any,
     *,
     campaign_budget_info_by_campaign: dict[str, dict[str, Any]],
-    campaign_goals_map: dict[str, list[str]],
 ) -> list[Any]:
     date_start, date_stop = get_daily_datetime_range(row)
 
@@ -2257,9 +2111,7 @@ def build_daily_search_term_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_goal_type_str(
-            campaign_id, campaign_goals_map, channel_type
-        ),
+        "google_ads_goal_type": get_goal_type_str(channel_type),
 
         "ad_group_id": str(row.ad_group.id),
         "ad_group_name": row.ad_group.name or None,
@@ -2688,8 +2540,6 @@ def build_asset_group_asset_clickhouse_row(row: Any) -> list[Any]:
 
 def build_gender_daily_clickhouse_row(
     row: Any,
-    *,
-    campaign_goals_map: dict[str, list[str]],
 ) -> list[Any]:
     date_start, date_stop = get_daily_datetime_range(row)
 
@@ -2720,9 +2570,7 @@ def build_gender_daily_clickhouse_row(
         "advertising_channel_sub_type": enum_name(
             row.campaign.advertising_channel_sub_type
         ),
-        "google_ads_goal_type": get_goal_type_str(
-            campaign_id, campaign_goals_map, channel_type
-        ),
+        "google_ads_goal_type": get_goal_type_str(channel_type),
 
         "ad_group_id": str(row.ad_group.id) if row.ad_group.id else None,
         "ad_group_name": row.ad_group.name or None,
@@ -2788,7 +2636,7 @@ def fetch_ad_hourly_data(
     customer_id: str,
     date_since: str,
     date_until: str,
-) -> tuple[dict[str, Any], dict[str, list[list[Any]]]]:
+) -> dict[str, Any]:
     client = get_client()
     google_ads_service = client.get_service("GoogleAdsService")
 
@@ -2797,14 +2645,7 @@ def fetch_ad_hourly_data(
         date_until=date_until,
     )
 
-    grouped_rows: dict[str, list[list[Any]]] = {
-        table_name: []
-        for table_name in clickhouse_db.HOURLY_TABLES
-    }
-
     raw_rows: list[dict[str, Any]] = []
-
-    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -2815,12 +2656,6 @@ def fetch_ad_hourly_data(
         for batch in stream:
             for row in batch.results:
                 raw_rows.append(row_to_raw_dict(row))
-
-                table_name, formatted_row = build_clickhouse_row(
-                    row,
-                    campaign_goals_map=campaign_goals_map,
-                )
-                grouped_rows[table_name].append(formatted_row)
 
     except GoogleAdsException as ex:
         print("Google Ads hourly request failed")
@@ -2832,7 +2667,7 @@ def fetch_ad_hourly_data(
 
         raise
 
-    response_data = {
+    return {
         "customer_id": customer_id,
         "date_since": date_since,
         "date_until": date_until,
@@ -2841,15 +2676,13 @@ def fetch_ad_hourly_data(
         "rows": raw_rows,
     }
 
-    return response_data, grouped_rows
-
 
 def fetch_ad_group_ad_daily_data(
     *,
     customer_id: str,
     date_since: str,
     date_until: str,
-) -> tuple[dict[str, Any], list[list[Any]]]:
+) -> dict[str, Any]:
     client = get_client()
     google_ads_service = client.get_service("GoogleAdsService")
 
@@ -2858,20 +2691,7 @@ def fetch_ad_group_ad_daily_data(
         date_until=date_until,
     )
 
-    grouped_rows: dict[str, list[list[Any]]] = {
-        table_name: []
-        for table_name in clickhouse_db.DAILY_TABLES
-    }
-
     raw_rows: list[dict[str, Any]] = []
-
-    campaign_budget_info_by_campaign = (
-        fetch_campaign_budget_info_by_campaign(
-            customer_id=customer_id
-        )
-    )
-
-    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -2882,18 +2702,6 @@ def fetch_ad_group_ad_daily_data(
         for batch in stream:
             for row in batch.results:
                 raw_rows.append(row_to_raw_dict(row))
-
-                table_name, formatted_row = (
-                    build_ad_group_ad_daily_clickhouse_row(
-                        row,
-                        campaign_budget_info_by_campaign=(
-                            campaign_budget_info_by_campaign
-                        ),
-                        campaign_goals_map=campaign_goals_map,
-                    )
-                )
-
-                grouped_rows[table_name].append(formatted_row)
 
     except GoogleAdsException as ex:
         print("Google Ads ad group ad daily request failed")
@@ -2905,19 +2713,14 @@ def fetch_ad_group_ad_daily_data(
 
         raise
 
-    response_data = {
+    return {
         "customer_id": customer_id,
         "date_since": date_since,
         "date_until": date_until,
         "query_name": "ad_group_ad_daily",
         "rows_count": len(raw_rows),
         "rows": raw_rows,
-        "campaign_budget_info_campaigns_count": len(
-            campaign_budget_info_by_campaign
-        ),
     }
-
-    return response_data, grouped_rows
 
 
 def fetch_geo_daily_data(
@@ -2925,7 +2728,7 @@ def fetch_geo_daily_data(
     customer_id: str,
     date_since: str,
     date_until: str,
-) -> tuple[dict[str, Any], list[list[Any]]]:
+) -> dict[str, Any]:
     client = get_client()
     google_ads_service = client.get_service("GoogleAdsService")
 
@@ -2934,11 +2737,7 @@ def fetch_geo_daily_data(
         date_until=date_until,
     )
 
-    rows: list[list[Any]] = []
-
     raw_rows: list[dict[str, Any]] = []
-    raw_proto_rows: list[Any] = []
-    geo_criterion_ids: set[str] = set()
 
     try:
         stream = google_ads_service.search_stream(
@@ -2949,23 +2748,6 @@ def fetch_geo_daily_data(
         for batch in stream:
             for row in batch.results:
                 raw_rows.append(row_to_raw_dict(row))
-                raw_proto_rows.append(row)
-
-                if row.geographic_view.country_criterion_id:
-                    geo_criterion_ids.add(
-                        str(row.geographic_view.country_criterion_id)
-                    )
-
-                region_id = resource_name_to_id(
-                    row.segments.geo_target_region
-                )
-                city_id = resource_name_to_id(row.segments.geo_target_city)
-
-                if region_id:
-                    geo_criterion_ids.add(region_id)
-
-                if city_id:
-                    geo_criterion_ids.add(city_id)
 
     except GoogleAdsException as ex:
         print("Google Ads geo daily request failed")
@@ -2977,52 +2759,14 @@ def fetch_geo_daily_data(
 
         raise
 
-    geo_constants_map = get_geo_target_constants_map(
-        customer_id=customer_id,
-        criterion_ids=geo_criterion_ids,
-    )
-
-    targeted_locations_by_campaign = fetch_targeted_locations_by_campaign(
-        customer_id=customer_id
-    )
-
-    campaign_budget_info_by_campaign = (
-        fetch_campaign_budget_info_by_campaign(
-            customer_id=customer_id
-        )
-    )
-
-    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
-
-    for row in raw_proto_rows:
-        formatted_row = build_geo_daily_clickhouse_row(
-            row,
-            geo_constants_map=geo_constants_map,
-            targeted_locations_by_campaign=targeted_locations_by_campaign,
-            campaign_budget_info_by_campaign=(
-                campaign_budget_info_by_campaign
-            ),
-            campaign_goals_map=campaign_goals_map,
-        )
-        rows.append(formatted_row)
-
-    response_data = {
+    return {
         "customer_id": customer_id,
         "date_since": date_since,
         "date_until": date_until,
         "query_name": "geo_daily",
         "rows_count": len(raw_rows),
         "rows": raw_rows,
-        "geo_constants_count": len(geo_constants_map),
-        "targeted_locations_campaigns_count": len(
-            targeted_locations_by_campaign
-        ),
-        "campaign_budget_info_campaigns_count": len(
-            campaign_budget_info_by_campaign
-        ),
     }
-
-    return response_data, rows
 
 
 def fetch_daily_campaign_data(
@@ -3030,7 +2774,7 @@ def fetch_daily_campaign_data(
     customer_id: str,
     date_since: str,
     date_until: str,
-) -> tuple[dict[str, Any], dict[str, list[list[Any]]]]:
+) -> dict[str, Any]:
     client = get_client()
     google_ads_service = client.get_service("GoogleAdsService")
 
@@ -3039,13 +2783,7 @@ def fetch_daily_campaign_data(
         date_until=date_until,
     )
 
-    grouped_rows: dict[str, list[list[Any]]] = {
-        table_name: []
-        for table_name in clickhouse_db.DAILY_CAMPAIGN_TABLES
-    }
-
     raw_rows: list[dict[str, Any]] = []
-    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -3056,15 +2794,6 @@ def fetch_daily_campaign_data(
         for batch in stream:
             for row in batch.results:
                 raw_rows.append(row_to_raw_dict(row))
-
-                table_name, formatted_row = (
-                    build_daily_campaign_clickhouse_row(
-                        row,
-                        campaign_goals_map=campaign_goals_map,
-                    )
-                )
-
-                grouped_rows[table_name].append(formatted_row)
 
     except GoogleAdsException as ex:
         print("Google Ads daily campaign request failed")
@@ -3076,7 +2805,7 @@ def fetch_daily_campaign_data(
 
         raise
 
-    response_data = {
+    return {
         "customer_id": customer_id,
         "date_since": date_since,
         "date_until": date_until,
@@ -3085,15 +2814,13 @@ def fetch_daily_campaign_data(
         "rows": raw_rows,
     }
 
-    return response_data, grouped_rows
-
 
 def fetch_daily_search_term_data(
     *,
     customer_id: str,
     date_since: str,
     date_until: str,
-) -> tuple[dict[str, Any], list[list[Any]]]:
+) -> dict[str, Any]:
     client = get_client()
     google_ads_service = client.get_service("GoogleAdsService")
 
@@ -3102,16 +2829,7 @@ def fetch_daily_search_term_data(
         date_until=date_until,
     )
 
-    rows: list[list[Any]] = []
     raw_rows: list[dict[str, Any]] = []
-
-    campaign_budget_info_by_campaign = (
-        fetch_campaign_budget_info_by_campaign(
-            customer_id=customer_id
-        )
-    )
-
-    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -3123,16 +2841,6 @@ def fetch_daily_search_term_data(
             for row in batch.results:
                 raw_rows.append(row_to_raw_dict(row))
 
-                rows.append(
-                    build_daily_search_term_clickhouse_row(
-                        row,
-                        campaign_budget_info_by_campaign=(
-                            campaign_budget_info_by_campaign
-                        ),
-                        campaign_goals_map=campaign_goals_map,
-                    )
-                )
-
     except GoogleAdsException as ex:
         print("Google Ads daily search term request failed")
         print(f"Request ID: {ex.request_id}")
@@ -3143,50 +2851,36 @@ def fetch_daily_search_term_data(
 
         raise
 
-    response_data = {
+    return {
         "customer_id": customer_id,
         "date_since": date_since,
         "date_until": date_until,
         "query_name": "daily_search_term",
         "rows_count": len(raw_rows),
         "rows": raw_rows,
-        "campaign_budget_info_campaigns_count": len(
-            campaign_budget_info_by_campaign
-        ),
     }
-
-    return response_data, rows
 
 
 def fetch_creative_assets_data(
     *,
     customer_id: str,
-) -> tuple[dict[str, Any], list[list[Any]]]:
+) -> dict[str, Any]:
     client = get_client()
     google_ads_service = client.get_service("GoogleAdsService")
 
-    rows: list[list[Any]] = []
     raw_rows: list[dict[str, Any]] = []
 
     queries_to_run = [
+        ("ad_group_ad_assets", queries.AD_GROUP_AD_ASSET_QUERY),
+        ("asset_group_assets", queries.ASSET_GROUP_ASSET_QUERY),
+        ("direct_image_ads", queries.DIRECT_IMAGE_AD_CREATIVE_QUERY),
         (
-            "ad_group_ad_assets",
-            queries.AD_GROUP_AD_ASSET_QUERY,
-            build_ad_group_ad_asset_clickhouse_row,
-        ),
-        (
-            "asset_group_assets",
-            queries.ASSET_GROUP_ASSET_QUERY,
-            build_asset_group_asset_clickhouse_row,
-        ),
-        (
-            "direct_image_ads",
-            queries.DIRECT_IMAGE_AD_CREATIVE_QUERY,
-            build_direct_image_ad_clickhouse_row,
+            "direct_video_responsive_ads",
+            queries.DIRECT_VIDEO_RESPONSIVE_AD_CREATIVE_QUERY,
         ),
     ]
 
-    for query_name, query_text, build_func in queries_to_run:
+    for query_name, query_text in queries_to_run:
         try:
             stream = google_ads_service.search_stream(
                 customer_id=customer_id,
@@ -3202,10 +2896,11 @@ def fetch_creative_assets_data(
                         }
                     )
 
-                    rows.append(build_func(row))
-
         except GoogleAdsException as ex:
-            print(f"Google Ads creative assets request failed: {query_name}")
+            print(
+                f"Google Ads creative assets request failed: "
+                f"{query_name}"
+            )
             print(f"Request ID: {ex.request_id}")
             print(f"Status: {ex.error.code().name}")
 
@@ -3214,62 +2909,7 @@ def fetch_creative_assets_data(
 
             raise
 
-    # Direct VIDEO_RESPONSIVE_AD отдельно:
-    # сначала собираем video asset ids,
-    # потом одним/несколькими запросами получаем YouTube metadata.
-    direct_video_rows: list[Any] = []
-    direct_video_asset_ids: set[str] = set()
-
-    try:
-        stream = google_ads_service.search_stream(
-            customer_id=customer_id,
-            query=queries.DIRECT_VIDEO_RESPONSIVE_AD_CREATIVE_QUERY,
-        )
-
-        for batch in stream:
-            for row in batch.results:
-                direct_video_rows.append(row)
-
-                raw_rows.append(
-                    {
-                        "asset_query_name": "direct_video_responsive_ads",
-                        "row": row_to_raw_dict(row),
-                    }
-                )
-
-                for video in row.ad_group_ad.ad.video_responsive_ad.videos:
-                    asset_id = resource_name_to_id(video.asset)
-
-                    if asset_id:
-                        direct_video_asset_ids.add(str(asset_id))
-
-    except GoogleAdsException as ex:
-        print(
-            "Google Ads creative assets request failed: "
-            "direct_video_responsive_ads"
-        )
-        print(f"Request ID: {ex.request_id}")
-        print(f"Status: {ex.error.code().name}")
-
-        for error in ex.failure.errors:
-            print(f"Error: {error.message}")
-
-        raise
-
-    youtube_video_assets_by_id = get_youtube_video_assets_by_ids(
-        customer_id=customer_id,
-        asset_ids=direct_video_asset_ids,
-    )
-
-    for row in direct_video_rows:
-        rows.extend(
-            build_direct_video_responsive_ad_clickhouse_rows(
-                row,
-                youtube_video_assets_by_id=youtube_video_assets_by_id,
-            )
-        )
-
-    response_data = {
+    return {
         "customer_id": customer_id,
         "query_name": "creative_assets",
         "rows_count": len(raw_rows),
@@ -3280,12 +2920,7 @@ def fetch_creative_assets_data(
             "direct_image_ad",
             "direct_video_responsive_ad",
         ],
-        "direct_video_asset_ids_count": len(direct_video_asset_ids),
-        "direct_video_assets_loaded_count": len(youtube_video_assets_by_id),
-        "clickhouse_rows_count": len(rows),
     }
-
-    return response_data, rows
 
 
 def fetch_gender_daily_data(
@@ -3293,7 +2928,7 @@ def fetch_gender_daily_data(
     customer_id: str,
     date_since: str,
     date_until: str,
-) -> tuple[dict[str, Any], list[list]]:
+) -> dict[str, Any]:
     client = get_client()
     google_ads_service = client.get_service("GoogleAdsService")
 
@@ -3303,9 +2938,6 @@ def fetch_gender_daily_data(
     )
 
     raw_rows: list[dict[str, Any]] = []
-    rows: list[list] = []
-
-    campaign_goals_map = fetch_campaign_goals(customer_id=customer_id)
 
     try:
         stream = google_ads_service.search_stream(
@@ -3317,13 +2949,6 @@ def fetch_gender_daily_data(
             for row in batch.results:
                 raw_rows.append(row_to_raw_dict(row))
 
-                rows.append(
-                    build_gender_daily_clickhouse_row(
-                        row,
-                        campaign_goals_map=campaign_goals_map,
-                    )
-                )
-
     except GoogleAdsException as ex:
         print("Google Ads gender daily request failed")
         print(f"Request ID: {ex.request_id}")
@@ -3332,16 +2957,13 @@ def fetch_gender_daily_data(
         for error in ex.failure.errors:
             print(f"Error: {error.message}")
 
-        return {
-            "rows_count": 0,
-            "data": [],
-            "error": str(ex),
-        }, []
+        raise
 
-    response_data = {
+    return {
+        "customer_id": customer_id,
+        "date_since": date_since,
+        "date_until": date_until,
+        "query_name": "gender_daily",
         "rows_count": len(raw_rows),
-        "data": raw_rows,
-        "campaign_goals_campaigns_count": len(campaign_goals_map),
+        "rows": raw_rows,
     }
-
-    return response_data, rows

@@ -871,14 +871,6 @@ FROM gender_view
 WHERE segments.date BETWEEN '{date_since}' AND '{date_until}'
 """
 
-CAMPAIGN_GOALS_QUERY = """
-SELECT
-  campaign.id,
-  campaign_goal.goal_type
-FROM campaign_goal
-WHERE campaign.status != 'REMOVED'
-"""
-
 
 DIRECT_IMAGE_AD_CREATIVE_QUERY = """
 SELECT

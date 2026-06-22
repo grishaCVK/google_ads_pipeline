@@ -1,5 +1,5 @@
 """
-core_loader.py
+google_core_loader.py
 
 Загрузка данных из staging в core.
 Вызывается из main.py после staging загрузки.
@@ -123,11 +123,6 @@ def _delete(
           AND toDate('{date_until}')
     """
     client.command(sql)
-
-
-def _dt(date_str: str) -> str:
-    """Конвертирует дату в DateTime строку Almaty."""
-    return f"{date_str} 00:00:00"
 
 
 def _union_select(
@@ -509,33 +504,56 @@ def load_geo_daily(
     )
     _delete(client, CORE_DB, table, date_since, date_until)
 
+    # Staging geo сегментирован по device × ad_network_type,
+    # а в core этих колонок нет — поэтому агрегируем до грейна
+    # (день, кампания, страна, регион, город), иначе строки
+    # задваиваются по числу комбинаций устройство×сеть.
+    agg_inner = f"""
+        SELECT
+            toStartOfDay(date_start)    AS d_start,
+            campaign_id                 AS c_id,
+            geo_country_name            AS country,
+            geo_region_name             AS region,
+            geo_city_name               AS city,
+            any(campaign_name)          AS c_name,
+            any(campaign_status)        AS c_status,
+            any(campaign_primary_status) AS c_eff,
+            any(google_ads_goal_type)   AS obj,
+            sum(spend)                  AS s_spend,
+            sum(impressions)            AS s_impr,
+            sum(clicks)                 AS s_clicks,
+            sum(video_views)            AS s_views
+        FROM {STAGING_DB}.{staging_table}
+        WHERE toDate(date_start)
+              BETWEEN toDate('{date_since}')
+              AND toDate('{date_until}')
+        GROUP BY d_start, c_id, country, region, city
+    """
+
     insert_sql = f"""
     INSERT INTO {CORE_DB}.{table}
     SELECT
-        date_start,
-        date_stop,
-        campaign_id,
-        campaign_name,
-        campaign_status,
-        campaign_primary_status     AS campaign_effective_status,
-        google_ads_goal_type        AS objective,
-        geo_country_name            AS country,
-        geo_region_name             AS region,
-        geo_city_name               AS city,
-        spend,
-        impressions,
-        average_cpm                 AS cpm,
-        clicks,
-        ctr,
-        average_cpc                 AS cpc,
-        average_cpv                 AS cpv,
-        video_views                 AS true_views,
-        view_rate,
+        d_start                     AS date_start,
+        d_start + INTERVAL 1 DAY    AS date_stop,
+        c_id                        AS campaign_id,
+        c_name                      AS campaign_name,
+        c_status                    AS campaign_status,
+        c_eff                       AS campaign_effective_status,
+        obj                         AS objective,
+        country,
+        region,
+        city,
+        s_spend                     AS spend,
+        s_impr                      AS impressions,
+        if(s_impr > 0, s_spend / s_impr * 1000, NULL) AS cpm,
+        s_clicks                    AS clicks,
+        if(s_impr > 0, s_clicks / s_impr, NULL) AS ctr,
+        if(s_clicks > 0, s_spend / s_clicks, NULL) AS cpc,
+        if(s_views > 0, s_spend / s_views, NULL) AS cpv,
+        s_views                     AS true_views,
+        if(s_impr > 0, s_views / s_impr, NULL) AS view_rate,
         now()                       AS loaded_at
-    FROM {STAGING_DB}.{staging_table}
-    WHERE toDate(date_start)
-          BETWEEN toDate('{date_since}')
-          AND toDate('{date_until}')
+    FROM ({agg_inner})
     """
     client.command(insert_sql)
 
@@ -772,9 +790,12 @@ def load_search_term_daily(
     )
     _delete(client, CORE_DB, table, date_since, date_until)
 
+    # Staging search_term сегментирован по device × ad_network,
+    # а метрик в core-таблице нет — только измерения. Без DISTINCT
+    # строки задвоятся по числу комбинаций устройство×сеть.
     insert_sql = f"""
     INSERT INTO {CORE_DB}.{table}
-    SELECT
+    SELECT DISTINCT
         date_start,
         date_stop,
         campaign_id,
